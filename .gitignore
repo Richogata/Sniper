@@ -1,0 +1,29 @@
+# Environnement Python
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Secrets — ne JAMAIS committer
+.streamlit/secrets.toml
+.env
+.env.*
+*.pem
+
+# Outils agents (références internes, pas nécessaires à l'app)
+.agent skills/
+
+# OS / éditeurs
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Logs & données locales
+*.log
+*.csv.tmp
