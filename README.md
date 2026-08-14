@@ -1,14 +1,24 @@
-# ⛏️ Scriba Omniscient Prospector v1.0
+# ⛏️ Scriba Omniscient Prospector v6
 
-Tableau de bord Streamlit de prospection automatisée pour **3 modèles d'affaires** depuis une seule interface :
+Tableau de bord Streamlit de prospection automatisée pour **4 modèles d'affaires** depuis une seule interface :
 
 | Mode | Cible | Paiement | Canal |
 |---|---|---|---|
 | 🖋️ **European Copywriting Sniper** | Agences immobilières (EU) | Virement SEPA — **IBAN Grey.co** | Email (FR/EN/DE) |
 | 🌍 **Local Web-Design Hunter** | PME sans site web (local / Afrique) | Split **10k/40k T-Money ou Flooz** | Email + WhatsApp |
 | 📍 **Local SEO Visibility** | Fiches Google Maps faibles | Split **10k/40k T-Money ou Flooz** | Email + WhatsApp |
+| 🤖 **AI Agency (MaisonNova)** | PME **3-20 employés** sans IA sur leur site | SEPA (EU) / split local (Afrique) | Email + WhatsApp |
 
 **Stack** : Streamlit · Google GenAI (Gemini) · Pandas · Requests · BeautifulSoup · `ddgs` (DuckDuckGo) · smtplib · Composio (optionnel).
+
+## 🆕 Nouveautés v6
+
+1. **Persistance ZÉRO perte** — `settings.json` sauvegarde automatiquement (à chaque modification) la clé Gemini, l'email expéditeur, le mot de passe d'application, le nom de l'agence, le pays, etc. — et recharge tout au démarrage. Le **logo** est enregistré en `logo.png`. ⚠️ Fichier local en clair : ne le committez jamais (gitignoré).
+2. **Découverte géo-localisée francophone** — sélecteur de pays [France, Belgique, Suisse, Luxembourg, Canada (Québec), Togo, Côte d'Ivoire, Sénégal, Bénin, Maroc] : le pays, la région DuckDuckGo, les villes suggérées et le ton des messages IA s'adaptent automatiquement.
+3. **LinkedIn Sniper** — profils de décideurs via Google Dorking (`site:linkedin.com/in/` + niche + ville), colonne dédiée « LinkedIn » dans le dashboard.
+4. **Audit IA des sites (module AI Agency)** — scan HTML parallèle (BeautifulSoup, 8 workers) : absence de `chatbot` / `assistant` / `IA` / `AI` / `Intercom` / `Crisp` + présence d'un `<form>` ou du mot « Contact » → lead marquée **🎯 Cible Prioritaire IA**. Filtres dédiés + colonnes `ai_target` / `ai_audit`.
+5. **Dashboard de campagnes** — tableau [Nom | Pays | Source | Statut Envoi | Réponse détectée (manuel)] + campagnes lancées suivies en direct, **taux de réponse** et **taux de clic** (liens trackés).
+6. **Personnalisation IA par pays** — Gemini rédige 100 % de l'email / du message WhatsApp selon la niche, la faille détectée et le pays cible (ton formel en France, plus chaleureux au Togo…).
 
 ---
 
@@ -32,18 +42,22 @@ L'app s'ouvre sur `http://localhost:8501`.
 
 ## 3. Configuration (barre latérale)
 
-1. **Identité** — nom de l'agence, **clé API Gemini** ([aistudio.google.com/apikey](https://aistudio.google.com/apikey)).
+> 💾 **Persistance automatique** : dès que vous modifiez un champ (agence, clés, pays, email…), il est écrit instantanément dans `settings.json` et rechargé au prochain démarrage — **zéro perte de données**, même après fermeture.
+
+1. **Identité** — nom de l'agence, **logo** (optionnel, enregistré en `logo.png`), **clé API Gemini** ([aistudio.google.com/apikey](https://aistudio.google.com/apikey)).
 2. **Gmail (smtplib)** — adresse + **mot de passe d'application** ([myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords)). ⚠️ La validation en 2 étapes doit être activée.
 3. **Composio (optionnel)** — clé API [composio.dev](https://composio.dev) pour envoyer via Gmail OAuth. Connectez le toolkit `gmail` avec `user_id = scriba-prospector-local`, puis choisissez « composio (Gmail OAuth) » dans l'onglet Outreach.
 4. **Mode** — choisissez l'un des 3 modèles d'affaires.
-5. **Localisation** — ville + pays.
-6. **Paiement & confiance** — votre **IBAN Grey.co** (injecté dans les emails EU) et le texte du **split T-Money / Flooz** (injecté pour les clients africains).
+5. **Localisation** — sélecteur **pays francophone** (10 pays) + ville : la région DuckDuckGo et le ton IA suivent le pays choisi.
+6. **Paiement & confiance** — votre **IBAN Grey.co** (injecté dans les emails EU) et le texte du **split T-Money / Flooz** (injecté pour les clients africains). Le pays cible ajuste automatiquement le bloc de paiement (Afrique → split local, EU → SEPA).
 7. **Langue de génération** — le toggle **FRANÇAIS / ENGLISH** bascule instantanément la langue des audits IA, des emails et des messages WhatsApp (modèles par défaut ; vos messages personnalisés sont préservés).
 
 ## 4. Utilisation
 
 ### 🧭 Onglet 1 — Lead Discovery & Scraper
 - **Recherche DuckDuckGo** : requêtes adaptées au mode + localisation (région réglable). Aucun coût, aucune clé.
+- **🎯 LinkedIn Sniper** : Google Dorking (`site:linkedin.com/in/`) pour trouver les profils des gérants/décideurs par niche + ville — ajoutés dans la colonne « LinkedIn » et en leads dédiées.
+- **🤖 Audit IA des sites** (module AI Agency) : scan HTML parallèle (workers réglables) → marquage **Cible Prioritaire IA** (filtres dédiés : « 🎯 Cible Prioritaire IA », « 🏢 ICP 3-20 employés »).
 - **Import CSV** : compatible avec les exports **Instant Data Scraper** (détection automatique des colonnes name/website/email/phone).
 - Table éditable (ajout manuel de numéros WhatsApp, suppression, export CSV), avec boutons **☑️ Tout sélectionner / ⬜ Tout désélectionner** (sélection totale en un clic) et compteur des leads cochées.
 - **Le filtre actif OU la sélection (✓) pilotent l'onglet Outreach** : si un filtre est actif dans Discovery (ex. « ⚠️ Sans site web »), **seuls ces leads sont contactés** — la sélection ✓ n'est prise en compte que lorsqu'aucun filtre n'est actif (compteur « 🎯 Destinataires » affiché en tête d'onglet).
@@ -57,12 +71,18 @@ L'app s'ouvre sur `http://localhost:8501`.
 - Audits stockés, éditables, exportables en Markdown.
 
 ### 🚀 Onglet 3 — Smart Outreach
+- **✨ Génération IA par pays (Gemini Flash)** : un clic rédige 100 % de l'email (objet + corps) ou du message WhatsApp — adapté à la niche, à la faille détectée et au pays cible (formel en France, plus chaleureux au Togo…), placeholders `{…}` conservés.
 - **Email** : éditeur de template avec placeholders `{AgencyName} {LeadName} {LeadWebsite} {LeadEmail} {Location} {Mode} {Audit} {PaymentPlan}` + insertion rapide par menu déroulant.
   - `{Audit}` = audit IA de la lead ; `{PaymentPlan}` = bloc paiement automatique (IBAN Grey.co pour l'EU, split T-Money/Flooz pour l'Afrique).
   - **Template libre** : écrivez l'objet et le corps avec les accolades `{…}` — remplacées automatiquement par les infos du client à l'envoi ; **toute colonne de la lead fonctionne** (ex. `{Phone}`, `{Segment}`, `{City}`, `{Country}`), insensible à la casse ; placeholder inconnu laissé tel quel, champ vide → « … ».
   - **Contenu enrichi** : 🖼️ upload d'images (jointes en inline `cid`, affichées dans Gmail), 🔗 bouton CTA doré, 🎬 lien vidéo — injectés dans l'email HTML (canal smtplib) ; + liens markdown `[texte](url)` et images `![légende](url)` directement dans le corps.
   - **Anti-spam** : envoi séquentiel avec délai aléatoire **60–120 s** (réglable), bouton **⏹️ Stop** réactif, journal en direct, mode test 2–6 s.
 - **WhatsApp** : génération de lien `wa.me` avec message persuasif pré-rempli (site + WhatsApp pour la diaspora, QR code + avis pour le SEO).
+
+### 📊 Onglet 4 — Dashboard de campagne (v6)
+- **Campagnes en cours** : tableau [Nom | Pays | Source (Maps/LinkedIn) | Statut Envoi | **Réponse détectée (manuel)**] — colonne dédiée pour marquer les réponses.
+- **Campagnes lancées** : suivi en direct des envois (En cours / Terminée / Interrompue).
+- **Statistiques** : Total contactés, **Taux de réponse**, **Taux de clic** (saisie manuelle des clics trackés), Taux de succès, répartition par segment, historique en direct.
 
 ## 5. Éthique & conformité
 

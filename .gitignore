@@ -15,6 +15,10 @@ __pycache__/
 .env.*
 *.pem
 
+# v6 — persistance locale (clés API / mot de passe d'application en clair) + logo
+settings.json
+logo.png
+
 # Outils agents (références internes, pas nécessaires à l'app)
 .agent skills/
 

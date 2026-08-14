@@ -2,8 +2,20 @@
 """Test AppTest des nouveaux widgets UI (filtres radio, secteurs, WhatsApp)."""
 from __future__ import annotations
 
+import os
+import shutil
+from pathlib import Path
+
 import pandas as pd
 from streamlit.testing.v1 import AppTest
+
+# ⚠️ Protège settings.json : l'app persiste automatiquement la session à chaque rendu.
+# Sans sauvegarde/restauration, un test écraserait la vraie clé Gemini de l'utilisateur.
+_SETTINGS = Path(__file__).resolve().parent / "settings.json"
+_BAK = Path(__file__).resolve().parent / "settings.json.bak"
+if _SETTINGS.exists():
+    shutil.copy2(_SETTINGS, _BAK)
+
 
 LEAD_COLS = ["name", "website", "email", "phone", "source", "flag", "segment", "snippet", "audit", "status"]
 
@@ -104,4 +116,9 @@ assert not at.exception, [e.value for e in at.exception]
 assert "Bonjour" in at.session_state["email_body"] or "listing" in at.session_state["email_body"]
 _out("[OK] Clic « Réinitialiser le modèle » (on_click) sans exception")
 
-_out("TOUS LES TESTS UI OK")
+_# Restaure settings.json (la session de test ne doit pas altérer les vraies clés)
+if _BAK.exists():
+    shutil.copy2(_BAK, _SETTINGS)
+    _BAK.unlink(missing_ok=True)
+
+out("TOUS LES TESTS UI OK")

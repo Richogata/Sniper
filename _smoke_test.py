@@ -10,8 +10,19 @@ def _out(msg: str) -> None:
     """Print sécurisé ASCII (console Windows cp1252)."""
     print(msg.encode("ascii", "backslashreplace").decode("ascii"))
 
+import shutil
+from pathlib import Path
+
 import pandas as pd
 from streamlit.testing.v1 import AppTest
+
+# ⚠️ Protège settings.json : l'app persiste automatiquement la session à chaque rendu.
+# Sans sauvegarde/restauration, un test écraserait la vraie clé Gemini de l'utilisateur.
+_SETTINGS = Path(__file__).resolve().parent / "settings.json"
+_BAK = Path(__file__).resolve().parent / "settings.json.bak"
+if _SETTINGS.exists():
+    shutil.copy2(_SETTINGS, _BAK)
+
 
 LEAD_COLS = ["name", "website", "email", "phone", "source", "flag", "segment", "snippet", "audit", "status"]
 
@@ -104,6 +115,11 @@ except StopIteration:
 except Exception as exc:  # noqa: BLE001
     _out(f"[FAIL] ÉCHEC test Appliquer : {exc}")
     raise SystemExit(1)
+
+# Restaure settings.json (la session de test ne doit pas altérer les vraies clés)
+if _BAK.exists():
+    shutil.copy2(_BAK, _SETTINGS)
+    _BAK.unlink(missing_ok=True)
 
 _out("")
 _out("[OK] TOUS LES TESTS RÉUSSIS")

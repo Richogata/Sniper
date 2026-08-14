@@ -1,13 +1,26 @@
 # -*- coding: utf-8 -*-
 """
 ====================================================================
-  SCRIBA OMNISCIENT PROSPECTOR — v1.0
+  SCRIBA OMNISCIENT PROSPECTOR — v6
   Tableau de bord Streamlit de prospection automatisée
   ------------------------------------------------------------------
-  3 modèles d'affaires depuis un seul dashboard :
+  4 modèles d'affaires depuis un seul dashboard :
     1) European Copywriting Sniper   -> agences immobilières (EU)
     2) Local Web-Design Hunter       -> PME sans site (local / Afrique)
     3) Local SEO Visibility          -> fiches Google Maps faibles
+    4) AI Agency (MaisonNova)        -> PME 3-20 employés sans IA (audit web)
+
+  v6 ajoute :
+    · Persistance ZÉRO perte — settings.json (clés, emails, agence, logo)
+      chargés au démarrage et sauvegardés instantanément.
+    · Découverte géo-localisée — sélecteur des 10 pays francophones.
+    · LinkedIn Sniper — profils décideurs via Google Dorking (site:linkedin.com/in/).
+    · Audit IA des sites — scan HTML (BeautifulSoup) : absence de chatbot/IA,
+      présence form/« Contact » -> marquage « Cible Prioritaire IA ».
+    · Dashboard de campagnes — tableau [Nom | Pays | Source | Statut | Réponse],
+      taux de clic et taux de réponse.
+    · Personnalisation IA par pays (Gemini Flash) — formel en France,
+      plus chaleureux au Togo, etc.
 
   Stack : Streamlit · Google GenAI (Gemini) · Pandas · Requests ·
           BeautifulSoup · ddgs (DuckDuckGo) · smtplib · Composio
@@ -18,6 +31,9 @@
 
 from __future__ import annotations
 
+import inspect
+import json
+import os
 import random
 import re
 import smtplib
@@ -25,11 +41,11 @@ import ssl
 import threading
 import time
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from email.message import EmailMessage
+from pathlib import Path
 from urllib.parse import quote
-
-import inspect
 
 import pandas as pd
 import requests
@@ -89,7 +105,8 @@ except ImportError:
 MODE_COPY = "European Copywriting Sniper"
 MODE_WEB = "Local Web-Design Hunter"
 MODE_SEO = "Local SEO Visibility"
-MODES = [MODE_COPY, MODE_WEB, MODE_SEO]
+MODE_AI = "AI Agency (MaisonNova)"
+MODES = [MODE_COPY, MODE_WEB, MODE_SEO, MODE_AI]
 
 MODE_INFO = {
     MODE_COPY: {
@@ -107,17 +124,23 @@ MODE_INFO = {
         "label": "📍 Local SEO Visibility",
         "desc": "Cible les fiches Google Maps faibles — QR code + avis 5 étoiles, WhatsApp, paiement local.",
     },
+    MODE_AI: {
+        "emoji": "🤖",
+        "label": "🤖 AI Agency (MaisonNova)",
+        "desc": "Cible les PME (3-20 employés) sans IA sur leur site — audit web automatique (chatbot/assistant/IA absents) et argumentaire « IA pour votre entreprise ».",
+    },
 }
 
 GEMINI_MODELS = [
-    "gemini-3.6-flash",   # dernier modèle stable -> DÉFAUT (le plus susceptible d'être dispo)
-    "gemini-3.5-flash",
+    "gemini-3.5-flash",   # DÉFAUT : répond actuellement (quota gratuit 3.6-flash souvent épuisé)
+    "gemini-3.6-flash",   # dernier modèle stable (souvent quota 429 sur plan gratuit)
     "gemini-2.5-flash",   # toujours supporté (compromis coût/performance)
     "gemini-2.5-pro",
     # NB : gemini-2.0-flash retiré de la liste — modèle arrêté par Google (404 NOT_FOUND)
 ]
 
-LEAD_COLS = ["name", "website", "email", "phone", "source", "flag", "segment", "snippet", "audit", "status"]
+LEAD_COLS = ["name", "website", "email", "phone", "source", "flag", "segment", "snippet", "audit", "status",
+             "linkedin", "employees", "ai_target", "ai_audit"]
 
 # --- Segments de prospection ciblée (architecture des leads) ---
 SEG_NO_SITE = "Segment A — Sans site web"
@@ -162,6 +185,17 @@ QUERIES = {
         "hôtel {city} {country} avis clients",
         "pharmacie {city} {country} horaires",
         "salon de coiffure {city} {country} avis",
+    ],
+    MODE_AI: [
+        "PME {city} {country}",
+        "entreprise de services {city} {country}",
+        "société {city} {country}",
+        "bureau {city} {country}",
+        "agence {city} {country}",
+        "startup {city} {country}",
+        "commerçant {city} {country}",
+        "hôtel {city} {country}",
+        "clinique {city} {country}",
     ],
 }
 
@@ -272,6 +306,43 @@ SECTORS = {
             "école {city} {country} avis", "centre de formation {city} {country} avis",
         ]},
     ],
+    MODE_AI: [
+        {"label": "🏢 PME & services B2B", "queries": [
+            "PME {city} {country}", "entreprise de services {city} {country}",
+            "société de conseil {city} {country}", "bureau d'études {city} {country}",
+        ]},
+        {"label": "🏥 Santé & bien-être", "queries": [
+            "clinique {city} {country}", "cabinet médical {city} {country}",
+            "pharmacie {city} {country}", "cabinet dentaire {city} {country}",
+        ]},
+        {"label": "🏨 Hôtellerie & tourisme", "queries": [
+            "hôtel {city} {country}", "agence de voyage {city} {country}",
+            "auberge {city} {country}", "location de voitures {city} {country}",
+        ]},
+        {"label": "🛍️ Commerce & distribution", "queries": [
+            "boutique {city} {country}", "magasin {city} {country}",
+            "grossiste {city} {country}", "e-commerce {city} {country}",
+        ]},
+        {"label": "🏠 Immobilier & construction", "queries": [
+            "agence immobilière {city} {country}", "promoteur immobilier {city} {country}",
+            "entreprise de construction {city} {country}", "architecte {city} {country}",
+        ]},
+        {"label": "🎓 Éducation & formation", "queries": [
+            "école {city} {country}", "centre de formation {city} {country}",
+            "institut {city} {country}", "école de langues {city} {country}",
+        ]},
+        {"label": "🍽️ Restaurants & cafés", "queries": [
+            "restaurant {city} {country}", "café {city} {country}", "traiteur {city} {country}",
+        ]},
+        {"label": "🔧 Artisans & industriels", "queries": [
+            "atelier {city} {country}", "menuiserie {city} {country}",
+            "garage {city} {country}", "imprimerie {city} {country}",
+        ]},
+        {"label": "🚚 Transport & logistique", "queries": [
+            "transport {city} {country}", "logistique {city} {country}",
+            "livraison {city} {country}", "taxi {city} {country}",
+        ]},
+    ],
 }
 
 DIRECTORY_HINTS = [
@@ -379,6 +450,22 @@ DEFAULT_TEMPLATES = {
             "ventes. Première optimisation offerte.\n\nÀ très vite,\n{AgencyName}\n\n—\n{PaymentPlan}"
         ),
     },
+    MODE_AI: {
+        "subject": "{LeadName} — Et si votre site accueillait vos clients 24h/24 ?",
+        "body": (
+            "Bonjour {LeadName},\n\n"
+            "Nous avons analysé votre présence en ligne à {Location} et relevé une opportunité "
+            "précise : votre site ne propose aujourd'hui aucun assistant IA ni chatbot. Or, la "
+            "plupart des visiteurs qui posent une question après les heures d'ouverture ne "
+            "reviennent jamais — c'est un chiffre d'affaires qui s'échappe chaque nuit.\n\n"
+            "{Audit}\n\n"
+            "Chez {AgencyName}, nous installons un assistant IA sur votre site : il répond aux "
+            "clients instantanément (24h/24), qualifie leurs demandes et leur fixe rendez-vous — "
+            "le tout en français, adapté à votre activité. Conçu pour les PME de 3 à 20 employés, "
+            "sans équipe technique. Premier déploiement pilote offert, sans engagement.\n\n"
+            "À très vite,\n{AgencyName}\n\n—\n{PaymentPlan}"
+        ),
+    },
 }
 
 DEFAULT_WA = {
@@ -396,6 +483,12 @@ DEFAULT_WA = {
         "Bonjour {LeadName} 👋\nJe vous propose d'augmenter votre chiffre d'affaires : un QR code sur "
         "votre comptoir + des avis 5 étoiles Google. Plus de visibilité = plus de clients chaque "
         "semaine. Chez {AgencyName}, la première optimisation est offerte. On en discute ?"
+    ),
+    MODE_AI: (
+        "Bonjour {LeadName} 👋\nJe suis {AgencyName}. Nous avons scanné votre site à {Location} : "
+        "aucun chatbot ni assistant IA n'y répond aux clients. Un assistant IA 24h/24 = des "
+        "demandes qualifiées et des rendez-vous automatiques. Déploiement pilote offert pour "
+        "les PME de 3 à 20 employés. On en parle ?"
     ),
 }
 
@@ -431,6 +524,22 @@ DEFAULT_TEMPLATES_EN = {
             "Best regards,\n{AgencyName}\n\n—\n{PaymentPlan}"
         ),
     },
+    MODE_AI: {
+        "subject": "{LeadName} — What if your website answered your customers 24/7?",
+        "body": (
+            "Hello {LeadName},\n\n"
+            "We analyzed your online presence in {Location} and spotted a precise opportunity: "
+            "your website currently offers no AI assistant or chatbot. Yet most visitors who ask "
+            "a question after business hours never come back — that is revenue slipping away "
+            "every night.\n\n"
+            "{Audit}\n\n"
+            "At {AgencyName}, we deploy an AI assistant on your website: it answers customers "
+            "instantly (24/7), qualifies their requests and books appointments — in French, "
+            "tailored to your business. Built for SMEs with 3 to 20 employees, no tech team "
+            "required. First pilot deployment offered, no commitment.\n\n"
+            "Best regards,\n{AgencyName}\n\n—\n{PaymentPlan}"
+        ),
+    },
 }
 
 EN_WA = {
@@ -449,7 +558,475 @@ EN_WA = {
         "5-star Google reviews. More visibility = more customers every week. At {AgencyName}, "
         "the first optimization is free. Interested?"
     ),
+    MODE_AI: (
+        "Hello {LeadName} 👋\nI'm from {AgencyName}. We scanned your website in {Location}: "
+        "no chatbot or AI assistant answers your customers. A 24/7 AI assistant = qualified "
+        "requests and automatic bookings. Free pilot deployment for SMEs with 3-20 employees. "
+        "Shall we talk?"
+    ),
 }
+
+
+# ------------------------------------------------------------------
+#  v6 — Persistance locale · Géolocalisation francophone ·
+#  Audit IA des sites · LinkedIn Sniper · Personnalisation IA par pays
+# ------------------------------------------------------------------
+
+SETTINGS_FILE = Path(__file__).resolve().parent / "settings.json"
+
+# Champs du dashboard sauvegardés instantanément dans settings.json.
+# ⚠️ Stockés EN CLAIR sur la machine locale (comme demandé) — protégez ce
+# fichier, ne le partagez pas et ne le committez jamais (cf. .gitignore).
+SETTINGS_KEYS = ["agency", "gemini_key", "gmail_user", "gmail_pass", "my_wa",
+                 "composio_key", "openai_key", "openai_model", "iban",
+                 "africa_payment", "city", "country", "fr_country", "lang_en",
+                 "ddg_region", "gmail_accounts", "warmup_enabled", "warmup_start",
+                 "daily_limit"]
+
+# --- Mots-clés IA détectés par l'Audit Web (module AI Agency) ---
+AI_AUDIT_KEYWORDS = ["chatbot", "assistant", "ia", "ai", "intercom", "crisp"]
+# Indices techniques plus fiables qu'un simple mot dans le texte visible.  Ces
+# fournisseurs laissent normalement une signature dans le HTML même lorsque le
+# widget n'est pas encore ouvert.
+AI_VENDOR_PATTERNS = {
+    "Intercom": r"intercom|widget\.intercom|intercomcdn",
+    "Crisp": r"crisp\.chat|\$crisp|client\.crisp",
+    "Tidio": r"tidio\.co|tidiochat",
+    "HubSpot chat": r"hubspot.*chat|hs-scripts\.com.*conversations",
+    "Drift": r"drift\.com|js\.driftt",
+    "Zendesk": r"zendesk.*web_widget|static\.zdassets",
+    "LiveChat": r"livechatinc\.com|__lc",
+    "Botpress": r"botpress",
+    "Tawk.to": r"tawk\.to|tawkto",
+    "JivoChat": r"jivosite|jivochat",
+    "ManyChat": r"manychat",
+    "Chatwoot": r"chatwoot",
+    "Tiledesk": r"tiledesk",
+    "LiveAgent": r"liveagent|ladesk\.com",
+    "Zopim": r"zopim",
+    "Freshchat": r"freshchat|freshworks\.com/widgets",
+    "Gorgias": r"gorgias\.chat",
+    "Olark": r"olark",
+    "Userlike": r"userlike",
+    "HelpCrunch": r"helpcrunch",
+    "Landbot": r"landbot",
+    "ChatBot.com": r"chatbot\.com|chatbotcdn",
+    "Acobot": r"acobot|acobot\.ai",
+    "MobileMonkey": r"mobilemonkey",
+    "Smooch": r"smooch|sunshineconversations",
+}
+# « IA » / « AI » sont des acronymes : correspondance EXACTE (majuscules) pour éviter
+# les faux positifs du français (« j'ai », « plaine », …). Les autres mots-clés sont
+# insensibles à la casse (chatbot, assistant, Intercom, Crisp…).
+AI_ACRONYMS = ("ia", "ai")
+AI_PATTERNS = {k: re.compile(re.escape(k), re.I) for k in AI_AUDIT_KEYWORDS
+               if k not in AI_ACRONYMS}
+AI_TARGET_YES = "🎯 Oui"
+
+# --- Pays francophones (sélecteur v6) ---
+_ACCENTS = str.maketrans(
+    "àâäéèêëîïôöùûüçÀÂÄÉÈÊËÎÏÔÖÙÛÜÇ",
+    "aaaeeeeiioouuucAAAEEEEIIOOUUUC")
+
+
+def _norm_key(s) -> str:
+    """Normalise une chaîne : minuscules, sans accents — pour comparer des pays/libellés."""
+    return str(s or "").translate(_ACCENTS).strip().lower()
+
+
+FRANCO_COUNTRIES = {
+    "France": {"country": "France", "region": "fr-fr", "africa": False,
+               "tone": "ton formel, sobre et professionnel — vouvoiement",
+               "cities": ["Paris", "Lyon", "Marseille", "Bordeaux", "Lille",
+                           "Toulouse", "Nantes", "Nice"]},
+    "Belgique": {"country": "Belgique", "region": "fr-be", "africa": False,
+                  "tone": "ton formel et courtois — vouvoiement",
+                  "cities": ["Bruxelles", "Liège", "Namur", "Charleroi", "Gand", "Anvers"]},
+    "Suisse": {"country": "Suisse", "region": "fr-ch", "africa": False,
+                "tone": "ton formel et précis — vouvoiement",
+                "cities": ["Genève", "Lausanne", "Fribourg", "Neuchâtel", "Sion", "Montreux"]},
+    "Luxembourg": {"country": "Luxembourg", "region": "fr-fr", "africa": False,
+                    "tone": "ton formel et professionnel — vouvoiement",
+                    "cities": ["Luxembourg", "Esch-sur-Alzette", "Differdange", "Dudelange"]},
+    "Canada (Québec)": {"country": "Québec", "region": "ca-fr", "africa": False,
+                         "tone": "ton professionnel et direct, un peu plus chaleureux — vouvoiement",
+                         "cities": ["Montréal", "Québec", "Laval", "Gatineau",
+                                     "Sherbrooke", "Trois-Rivières"]},
+    "Togo": {"country": "Togo", "region": "wt-wt", "africa": True,
+              "tone": "ton chaleureux et convivial, mais professionnel — vouvoiement respectueux",
+              "cities": ["Lomé", "Kara", "Sokodé", "Kpalimé", "Atakpamé"]},
+    "Côte d'Ivoire": {"country": "Côte d'Ivoire", "region": "wt-wt", "africa": True,
+                       "tone": "ton chaleureux et convivial, mais professionnel — vouvoiement respectueux",
+                       "cities": ["Abidjan", "Bouaké", "Yamoussoukro", "San-Pédro", "Korhogo"]},
+    "Sénégal": {"country": "Sénégal", "region": "wt-wt", "africa": True,
+                 "tone": "ton chaleureux et respectueux, mais professionnel — vouvoiement",
+                 "cities": ["Dakar", "Thiès", "Saint-Louis", "Touba", "Ziguinchor"]},
+    "Bénin": {"country": "Bénin", "region": "wt-wt", "africa": True,
+               "tone": "ton chaleureux et convivial, mais professionnel — vouvoiement respectueux",
+               "cities": ["Cotonou", "Porto-Novo", "Parakou", "Abomey-Calavi", "Bohicon"]},
+    "Maroc": {"country": "Maroc", "region": "wt-wt", "africa": True,
+               "tone": "ton courtois et professionnel, légèrement chaleureux — vouvoiement",
+               "cities": ["Casablanca", "Rabat", "Marrakech", "Fès", "Tanger", "Agadir"]},
+}
+FRANCO_LABELS = list(FRANCO_COUNTRIES) + ["✍️ Autre / libre"]
+AFRICAN_COUNTRY_TERMS = {info["country"] for info in FRANCO_COUNTRIES.values()
+                         if info["africa"]}
+_AFRICAN_NORM = {_norm_key(c) for c in AFRICAN_COUNTRY_TERMS}
+
+REGIONS = ["fr-fr", "fr-be", "fr-ch", "ca-fr", "en-gb", "de-de", "wt-wt", "us-en"]
+
+# Réponses manuelles possibles (colonne « Réponse détectée » du Dashboard)
+RESPONSE_OPTS = ["", "✅ Répondu", "📅 Rendez-vous", "❌ Pas intéressé", "📞 À rappeler"]
+
+# --- Détection des numéros MOBILES par pays (liens wa.me) ---
+MOBILE_PREFIXES = {
+    "33": ("6", "7"),          # France
+    "32": ("4",),              # Belgique
+    "41": ("7",),              # Suisse
+    "352": ("6",),             # Luxembourg
+    "1": ("3", "4", "5", "6", "7", "8", "9"),  # Canada / Québec
+    "228": ("9",),             # Togo (mobiles en 9x)
+    "229": ("4", "6", "9"),   # Bénin
+    "225": ("0", "5", "7", "8"),  # Côte d'Ivoire
+    "221": ("7",),             # Sénégal
+    "212": ("6", "7"),         # Maroc
+}
+
+
+def load_settings() -> dict:
+    """Charge settings.json (persistance ZÉRO perte) — dict vide si absent/corrompu."""
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _settings_snapshot() -> dict:
+    """Instantané des champs à persister (None → ""). Les dates sont converties
+    en ISO (JSON ne sait pas sérialiser un objet datetime.date)."""
+    out = {}
+    for k in SETTINGS_KEYS:
+        v = st.session_state.get(k)
+        if v is None:
+            out[k] = ""
+        elif isinstance(v, datetime):
+            out[k] = v.date().isoformat()
+        elif hasattr(v, "isoformat"):  # datetime.date (date_input)
+            out[k] = v.isoformat()
+        else:
+            out[k] = v
+    return out
+
+
+def persist_settings() -> None:
+    """Sauvegarde instantanée : écrit settings.json dès qu'un champ change."""
+    snap = _settings_snapshot()
+    if snap == st.session_state.get("_settings_hash"):
+        return  # rien n'a changé → aucune écriture disque
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(snap, f, ensure_ascii=False, indent=2)
+        st.session_state["_settings_hash"] = snap
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def tone_for_country(country: str) -> str:
+    """Ton IA cible selon le pays (formel en France, plus chaleureux au Togo…)."""
+    c = _norm_key(country)
+    for label, info in FRANCO_COUNTRIES.items():
+        if c and (c == _norm_key(info["country"]) or c == _norm_key(label)
+                  or _norm_key(label).startswith(c) or c.startswith(_norm_key(label))):
+            return info["tone"]
+    return "ton professionnel et courtois — vouvoiement"
+
+
+def is_mobile_phone(phone) -> bool:
+    """True si le numéro correspond à un indicatif MOBILE (France +33 6/7, Togo +228 9x,
+    Sénégal +221 7x, Maroc +212 6/7, Québec +1, etc.) — sinon False (fixe/inconnu)."""
+    digits = re.sub(r"\D", "", phone or "")
+    if not digits:
+        return False
+    for cc, prefixes in MOBILE_PREFIXES.items():
+        if digits.startswith(cc):
+            rest = digits[len(cc):]
+            return bool(rest and rest[0] in prefixes)
+    return False
+
+
+# --- Audit IA des sites (module AI Agency — balayage HTML BeautifulSoup) ---
+
+def analyze_ai_html(html: str) -> dict:
+    """Analyse le HTML d'un site : absence des mots-clés IA (chatbot, assistant, IA, AI,
+    Intercom, Crisp) + présence d'un <form> ou du mot « Contact » → Cible Prioritaire IA.
+    Extrait aussi le titre, la meta description et le texte visible — utilisés ensuite
+    par Gemini pour un audit argumenté sur le contenu RÉEL du site."""
+    base = {"missing": [], "has_form": False, "has_contact": False, "target": False,
+            "signals": [], "title": "", "meta": "", "text": "", "detail": ""}
+    if not html:
+        return {**base, "missing": list(AI_AUDIT_KEYWORDS),
+                "detail": "Site inaccessible ou page vide."}
+    if not _BS4_AVAILABLE:
+        return {**base, "missing": list(AI_AUDIT_KEYWORDS),
+                "detail": "BeautifulSoup absent — installez `beautifulsoup4`."}
+    soup = BeautifulSoup(html, "html.parser")
+    html_low = html.lower()
+    title = (soup.title.get_text(" ", strip=True) if soup.title else "")[:200]
+    meta = ""
+    mt = soup.find("meta", attrs={"name": "description"})
+    if mt and mt.get("content"):
+        meta = str(mt["content"]).strip()[:300]
+    for t in soup(["script", "style"]):
+        t.decompose()
+    text_raw = soup.get_text(" ", strip=True) or ""
+    text_low = text_raw.lower()
+    missing = []
+    for k in AI_AUDIT_KEYWORDS:
+        if k in AI_ACRONYMS:
+            # Acronyme : correspondance EXACTE « IA » / « AI » (pas « j'ai »)
+            hit = bool(re.search(rf"\b{re.escape(k.upper())}\b", text_raw))
+        else:
+            hit = bool(AI_PATTERNS[k].search(text_low))
+        if not hit:
+            missing.append(k)
+    has_form = bool(soup.find("form"))
+    has_contact = bool(re.search(r"contact", text_low))
+    signals = [label for label, pattern in AI_VENDOR_PATTERNS.items()
+               if re.search(pattern, html_low, re.I)]
+    # Le ciblage ne doit pas dépendre de l'absence d'UN SEUL mot-clé : c'était
+    # la source principale de faux positifs. Un site est prioritaire seulement
+    # s'il propose un moyen de contact et qu'aucun assistant/chat identifiable
+    # (visible ou technique) n'est trouvé.
+    has_ai = bool(signals) or not missing
+    target = bool(not has_ai and (has_form or has_contact))
+    parts = []
+    if signals:
+        parts.append("assistant/chat détecté : " + ", ".join(signals))
+    elif has_ai:
+        parts.append("indice IA/chatbot visible sur le site")
+    else:
+        parts.append("aucun assistant ou chatbot identifiable dans la page analysée")
+    parts.append("formulaire de contact présent" if has_form else "pas de formulaire")
+    parts.append("mot « Contact » présent" if has_contact else "mot « Contact » absent")
+    detail = " — ".join(parts) + (" → 🎯 Cible Prioritaire IA." if target else "")
+    text = re.sub(r"\s+", " ", text_raw).strip()[:600]
+    return {"missing": missing, "has_form": has_form, "has_contact": has_contact,
+            "signals": signals, "target": target, "detail": detail,
+            "title": title, "meta": meta, "text": text}
+
+
+def audit_ai_website(url: str) -> dict:
+    """Vérifie le site (requests + BeautifulSoup) et applique les critères « Cible Prioritaire IA ».
+    Retourne aussi titre / meta / texte visible pour alimenter l'audit Gemini."""
+    base = {"missing": [], "has_form": False, "has_contact": False, "target": False,
+            "signals": [], "title": "", "meta": "", "text": "", "detail": ""}
+    if not url or not has_website(url):
+        return {**base, "detail": "Pas de site web professionnel (annuaire / réseau social) — "
+                                  "hors périmètre IA."}
+    try:
+        r = requests.get(normalize_url(url), timeout=12, headers={"User-Agent": UA},
+                         allow_redirects=True)
+        if r.status_code != 200:
+            return {**base, "detail": f"Site inaccessible (HTTP {r.status_code})."}
+        res = analyze_ai_html(r.text)
+        # Rapport enrichi : titre + description + conclusion — utilisable tel quel
+        # par Gemini comme « faille détectée » dans l'argumentaire de vente.
+        parts = []
+        if res.get("title"):
+            parts.append(f"Titre : {res['title']}")
+        parts.append(res.get("detail", ""))
+        if res.get("meta"):
+            parts.append(f"Description : {res['meta']}")
+        res["detail"] = " — ".join(p for p in parts if p)
+        return res
+    except Exception as exc:  # noqa: BLE001
+        return {**base, "detail": f"Erreur lors du scan de {str(url)[:60]} : {exc}"}
+
+
+def audit_ai_batch(df: pd.DataFrame, progress_cb=None, max_workers: int = 8) -> pd.DataFrame:
+    """Audit IA parallèle (ThreadPoolExecutor — l'UI reste fluide, RAM ~40 Mo/worker).
+    Remplit les colonnes ai_target / ai_audit en conservant l'index d'origine."""
+    df = df.copy()
+    if df.empty:
+        return df
+    for col in ("ai_target", "ai_audit"):
+        if col not in df.columns:
+            df[col] = ""
+    urls = [str(r.get("website", "") or "") for _, r in df.iterrows()]
+    results: list[dict] = [None] * len(df)  # type: ignore[list-item]
+    done = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(audit_ai_website, u): i for i, u in enumerate(urls)}
+        for fut in as_completed(futures):
+            i = futures[fut]
+            try:
+                results[i] = fut.result()
+            except Exception:  # noqa: BLE001
+                results[i] = {"missing": [], "has_form": False, "has_contact": False,
+                              "signals": [], "target": False, "title": "", "meta": "",
+                              "text": "", "detail": "Erreur de scan."}
+            done += 1
+            if progress_cb:
+                progress_cb(done / len(df))
+    for i, res in enumerate(results):
+        df.loc[df.index[i], "ai_target"] = AI_TARGET_YES if res["target"] else ""
+        df.loc[df.index[i], "ai_audit"] = res.get("detail", "")
+    return df
+
+
+# --- LinkedIn Sniper (Google Dorking via DuckDuckGo — gratuit) ---
+
+def search_linkedin_profiles(niche: str, city: str, country: str, region: str = "wt-wt",
+                             max_results: int = 10) -> list[dict]:
+    """Profils de décideurs via site:linkedin.com/in/ + niche + ville.
+    Retourne une liste de dicts {name, url, title}."""
+    if not _DDGS_AVAILABLE:
+        raise RuntimeError("Librairie de recherche absente — installez `ddgs` (pip install ddgs).")
+    parts = [p for p in ("site:linkedin.com/in/", niche, city, country) if str(p).strip()]
+    query = " ".join(parts)
+    try:
+        results = DDGS().text(query, region=region or "wt-wt", max_results=int(max_results))
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"Recherche LinkedIn impossible : {exc}") from exc
+    rows: list[dict] = []
+    seen: set[str] = set()
+    for r in results or []:
+        url = normalize_url(r.get("href") or "")
+        if "linkedin.com/in/" not in url.lower():
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        title = re.sub(r"\s*[|•·–—-]\s*LinkedIn.*$", "", r.get("title") or "", flags=re.I)
+        rows.append({"name": clean_name(title) or "Profil LinkedIn",
+                     "url": url, "title": (r.get("title") or "")[:140]})
+    return rows
+
+
+# --- Personnalisation IA par pays (Gemini Flash — 100 % du message rédigé par l'IA) ---
+
+def _parse_gen_email(raw: str) -> tuple[str, str]:
+    """Extrait objet + corps d'une sortie « OBJET: … / CORPS: … » (repli robuste).
+    Accepte les variantes markdown (**OBJET:**), « Sujet: » / « Subject: » et
+    « Corps: » / « Body: » selon la langue du modèle."""
+    raw = (raw or "").strip()
+    # Découpe proprement les marqueurs markdown gras (**…) — les étoiles peuvent
+    # apparaître AVANT OU APRÈS le deux-points : « **OBJET:** » comme « OBJET : ».
+    _star = r"\*{0,2}\s*"
+    _lab = _star + r"(?:OBJET|SUJET|SUBJECT|OBJECT)" + _star
+    m_subj = re.search(_lab + r"[:：]" + _star + r"([^\n]+)", raw, re.I)
+    _lab2 = _star + r"(?:CORPS|BODY|MESSAGE)" + _star
+    m_body = re.search(_lab2 + r"[:：]" + _star + r"(.+)", raw, re.I | re.S)
+    if m_subj and m_body:
+        return m_subj.group(1).strip(), m_body.group(1).strip()
+    if m_subj:
+        return m_subj.group(1).strip(), raw
+    if m_body:
+        return raw[:80].strip(), m_body.group(1).strip()
+    lines = [l for l in raw.splitlines() if l.strip()]
+    if len(lines) > 1:
+        return lines[0][:120], "\n".join(lines[1:]).strip()
+    return "", raw
+
+
+def personalize_email(mode: str, agency: str, city: str, country: str, lang: str, lead,
+                      audit: str = "", faille: str = "", api_key: str = "",
+                      model: str = GEMINI_MODELS[0], temperature: float = 0.7) -> tuple[str, str]:
+    """Gemini rédige 100 % de l'email (objet + corps) : niche, faille détectée, pays cible
+    (formel en France, plus chaleureux au Togo…). Placeholders {…} conservés."""
+    en = lang != "fr"
+    tone = tone_for_country(country)
+    lead_name = str(lead.get("name", "") or "…")
+    snippet = str(lead.get("snippet", "") or "").strip()
+    employees = str(lead.get("employees", "") or "").strip()
+    site = str(lead.get("website", "") or "").strip()
+    # Angle réel : audit IA du site (MODE_AI) ou contenu récupéré du site
+    angle = faille or audit or "diagnostic standard du secteur"
+    if snippet and len(snippet) > 30:
+        angle += f" | Contenu réel du site : {snippet[:500]}"
+    if employees:
+        angle += f" | Effectif : {employees} employés"
+    prompt = (
+        "Tu es un copywriter senior B2B. Rédige UN email de prospection COMPLET — l'objet ET le "
+        "corps — 100 % personnalisé pour ce prospect et adapté au pays cible.\n"
+        f"· Service : {MODE_INFO[mode]['desc']}\n"
+        f"· Prospect : « {lead_name} » ({city} {country})\n"
+        f"· Site : {site or 'non communiqué'}\n"
+        f"· Angle / constat réel : {angle}\n"
+        f"· Ton cible ({country}) : {tone}.\n"
+        f"· Langue : {'Anglais' if en else 'Français'}.\n"
+        "Contraintes impératives :\n"
+        "- N'invente AUCUN chiffre, prix, statistique ou témoignage précis ; appuie-toi "
+        "sur le constat réel fourni (contenu du site, audit).\n"
+        "- Email sobre, percutant, ~150-180 mots maximum, avec un CTA clair.\n"
+        "- Utilise les placeholders {LeadName}, {Location}, {AgencyName}, {Audit} si besoin — "
+        "ils seront remplacés automatiquement ; n'écris PAS le nom réel dans le corps.\n"
+        "- Signe avec l'agence via le placeholder {AgencyName}.\n"
+        "- Format STRICT, exactement :\n"
+        "OBJET: <objet en une ligne>\n"
+        "CORPS:\n<corps complet>\n"
+    )
+    raw = gemini_generate(api_key, model, prompt, temperature=temperature, max_tokens=900)
+    subject, body = _parse_gen_email(raw)
+    if not subject:
+        subject = f"{lead_name} — {mode}"[:140]
+    return subject, body
+
+
+def personalize_wa(mode: str, agency: str, city: str, country: str, lang: str, lead,
+                   faille: str = "", api_key: str = "",
+                   model: str = GEMINI_MODELS[0], temperature: float = 0.7) -> str:
+    """Gemini rédige le message WhatsApp (max ~250 caractères) adapté au pays et à la faille."""
+    en = lang != "fr"
+    tone = tone_for_country(country)
+    lead_name = str(lead.get("name", "") or "…")
+    snippet = str(lead.get("snippet", "") or "").strip()
+    angle = faille or "diagnostic standard du secteur"
+    if snippet and len(snippet) > 30:
+        angle += f" | Contenu réel du site : {snippet[:300]}"
+    prompt = (
+        "Tu es un commercial senior expert en prospection WhatsApp. Rédige UN message WhatsApp "
+        "de prospection B2B (max 250 caractères, pas d'émoticône excessive).\n"
+        f"· Service : {MODE_INFO[mode]['desc']}\n"
+        f"· Prospect : « {lead_name} » ({city} {country})\n"
+        f"· Angle / constat réel : {angle}\n"
+        f"· Ton cible ({country}) : {tone}.\n"
+        f"· Langue : {'Anglais' if en else 'Français'}.\n"
+        "· Utilise les placeholders {LeadName}, {Location}, {AgencyName} — remplacés "
+        "automatiquement.\n"
+        "· Termine par une question simple (CTA) ; n'invente AUCUN chiffre.\n"
+    )
+    raw = gemini_generate(api_key, model, prompt, temperature=temperature, max_tokens=400)
+    return (raw or "").strip()
+
+
+# --- Suivi des campagnes lancées (Dashboard « Campagnes en cours ») ---
+
+def _campaign_append(channel: str, total: int) -> dict:
+    """Ajoute une campagne lancée dans le registre de session (Dashboard)."""
+    camps = st.session_state.setdefault("campaigns", [])
+    rec = {
+        "id": int(time.time() * 1000) % 10 ** 9,
+        "nom": f"Campagne {len(camps) + 1} — {st.session_state.get('mode', '')}",
+        "pays": st.session_state.get("country", "") or "—",
+        "source": channel,
+        "total": int(total),
+        "envoyés": 0,
+        "statut": "En cours",
+        "début": datetime.now().strftime("%d/%m %H:%M"),
+    }
+    camps.append(rec)
+    return rec
+
+
+def _campaign_update(campaign_id: int, sent: int, statut: str) -> None:
+    for rec in st.session_state.get("campaigns", []):
+        if rec.get("id") == campaign_id:
+            rec["envoyés"] = int(sent)
+            rec["statut"] = statut
+            return
 
 
 # ------------------------------------------------------------------
@@ -516,6 +1093,8 @@ def classify_flag(url: str, mode: str) -> str:
         return "Agence immobilière"
     if mode == MODE_WEB:
         return "⚠️ Probablement sans site pro" if is_directory else "Site détecté"
+    if mode == MODE_AI:
+        return "⚠️ PME sans site (hors périmètre IA)" if is_directory else "Site détecté"
     return "⚠️ Fiche Google Maps à améliorer ?" if is_directory else "Site présent"
 
 
@@ -541,6 +1120,7 @@ def classify_segment(website) -> str:
 
 FILTER_OPTIONS = ["Tous les leads", "✅ Avec site web", "⚠️ Sans site web",
                   "📧 Avec email", "📞 Avec téléphone",
+                  "🎯 Cible Prioritaire IA", "🏢 ICP 3-20 employés (IA)",
                   "🗂️ Segment A (sans site)", "🗂️ Segment B (site médiocre)"]
 
 
@@ -558,6 +1138,19 @@ def apply_lead_filter(df: pd.DataFrame, opt: str) -> pd.Series:
         return df["segment"].astype(str).str.startswith("Segment A")
     if opt == "🗂️ Segment B (site médiocre)":
         return df["segment"].astype(str).str.startswith("Segment B")
+    if opt == "🎯 Cible Prioritaire IA":
+        if "ai_target" not in df.columns:
+            return pd.Series(False, index=df.index)
+        return df["ai_target"].astype(str).str.contains("Oui")
+    if opt == "🏢 ICP 3-20 employés (IA)":
+        if "employees" not in df.columns:
+            return pd.Series(False, index=df.index)
+
+        def _icp(v) -> bool:
+            m = re.search(r"\d+", str(v))
+            return bool(m and 3 <= int(m.group()) <= 20)
+
+        return df["employees"].map(_icp)
     return pd.Series(True, index=df.index)
 
 
@@ -598,24 +1191,38 @@ def build_queries(mode: str, city: str, country: str,
             for q in queries]
 
 
-def fetch_snippet(url: str, max_chars: int = 900) -> str:
-    """Extrait léger (meta description / premier <p>) — pas de rendu JS."""
+def fetch_snippet(url: str, max_chars: int = 1400) -> str:
+    """Extrait le contenu RÉEL d'un site : titre + meta description + texte visible
+    (les 2-3 premiers paragraphes). Alimente l'audit Gemini pour des argumentaires
+    basés sur le site, pas sur un texte générique."""
     if not url or not _BS4_AVAILABLE:
         return ""
     try:
-        r = requests.get(url, timeout=8, headers={"User-Agent": UA}, allow_redirects=True)
+        r = requests.get(normalize_url(url), timeout=12, headers={"User-Agent": UA},
+                         allow_redirects=True)
         if r.status_code != 200:
             return ""
         soup = BeautifulSoup(r.text, "html.parser")
+        for t in soup(["script", "style", "noscript"]):
+            t.decompose()
+        title = (soup.title.get_text(" ", strip=True) if soup.title else "").strip()
         meta = soup.find("meta", attrs={"name": "description"})
-        if meta and meta.get("content"):
-            return meta["content"].strip()[:max_chars]
-        p = soup.find("p")
-        if p:
-            return p.get_text(" ", strip=True)[:max_chars]
+        meta_txt = (str(meta["content"]).strip() if meta and meta.get("content") else "")
+        # Paragraphes les plus informatifs (2-3 premiers avec un minimum de contenu)
+        paras = [p.get_text(" ", strip=True) for p in soup.find_all("p")
+                 if len(p.get_text(" ", strip=True)) > 40]
+        body = "\n".join(paras[:3])[:max_chars]
+        parts = [p for p in (title, meta_txt, body) if p]
+        if not parts:
+            return ""
+        # Déduplication simple (titre répété dans le corps…)
+        joined = parts[0]
+        for p in parts[1:]:
+            if p[:60] not in joined:
+                joined += "\n" + p
+        return joined[:max_chars * 2]
     except Exception:
-        pass
-    return ""
+        return ""
 
 
 # ------------------------------------------------------------------
@@ -630,7 +1237,7 @@ def search_leads(mode: str, city: str, country: str, region: str, max_results: i
 
     rows: list[dict] = []
     seen: set[str] = set()
-    want_phone = mode in (MODE_WEB, MODE_SEO)
+    want_phone = mode in (MODE_WEB, MODE_SEO, MODE_AI)
     queries = build_queries(mode, city, country, sectors)
 
     for qi, q in enumerate(queries):
@@ -661,6 +1268,10 @@ def search_leads(mode: str, city: str, country: str, region: str, max_results: i
                 "snippet": "",
                 "audit": "",
                 "status": "",
+                "linkedin": "",
+                "employees": "",
+                "ai_target": "",
+                "ai_audit": "",
             })
         if progress_cb:
             progress_cb((qi + 1) / len(queries))
@@ -669,21 +1280,70 @@ def search_leads(mode: str, city: str, country: str, region: str, max_results: i
 
 
 def parse_csv_leads(uploaded) -> pd.DataFrame:
-    """Mapping souple des colonnes d'un export Instant Data Scraper."""
-    df = pd.read_csv(uploaded)
+    """Import CSV/XLSX robuste : encodage Excel Windows et séparateur auto."""
+    raw = uploaded.getvalue() if hasattr(uploaded, "getvalue") else uploaded.read()
+    if not raw:
+        raise ValueError("Le fichier est vide.")
+    filename = str(getattr(uploaded, "name", "")).lower()
+    if filename.endswith((".xlsx", ".xls")):
+        try:
+            df = pd.read_excel(__import__("io").BytesIO(raw), dtype=str)
+        except ImportError as exc:
+            raise ValueError("Import Excel indisponible : installez openpyxl.") from exc
+    else:
+        last_error = None
+        for encoding in ("utf-8-sig", "utf-8", "cp1252", "latin1"):
+            try:
+                # sep=None détecte automatiquement ; engine python gère ; et ,.
+                df = pd.read_csv(__import__("io").BytesIO(raw), encoding=encoding,
+                                 sep=None, engine="python", dtype=str)
+                break
+            except (UnicodeDecodeError, pd.errors.ParserError) as exc:
+                last_error = exc
+        else:
+            raise ValueError(f"CSV illisible : {last_error}")
+    if df.empty:
+        raise ValueError("Le fichier ne contient aucune ligne.")
     df = df.where(pd.notna(df), "")
-    low = {c: str(c).lower() for c in df.columns}
+    low = {c: str(c).strip().lower() for c in df.columns}
+
+    # Bornes de mot : lettres accentuées incluses — « hotel » ne doit PAS matcher
+    # « tel », « domain » ne doit PAS matcher « in », « job title » reste un repli.
+    _WORD = "a-zà-öø-ÿ0-9"
 
     def pick(names: list[str]) -> str | None:
+        # 1) nom de colonne EXACT (priorité absolue)
         for col in df.columns:
-            if any(n in low[col] for n in names):
+            if low[col] in names:
+                return col
+        # 2) mot entier dans le nom de colonne
+        for col in df.columns:
+            cname = low[col]
+            if any(re.search(rf"(?<![{_WORD}]){re.escape(n)}(?![{_WORD}])", cname)
+                   for n in names if len(n) >= 2):
+                return col
+        # 3) sous-chaîne — uniquement pour des libellés assez précis (>= 4 lettres)
+        for col in df.columns:
+            cname = low[col]
+            if any(n in cname for n in names if len(n) >= 4):
                 return col
         return None
 
-    name_c = pick(["name", "nom", "business", "company", "title", "entreprise"])
+    # Nom : on préfère nettement name/nom/entreprise/company — « title » (exports
+    # Instant Data Scraper) n'est qu'un repli, jamais au détriment d'un « job title ».
+    name_c = pick(["name", "nom", "business", "company", "entreprise", "société",
+                   "raison sociale"]) or pick(["title", "titre"])
+    first_c = pick(["first name", "prénom"])
+    last_c = pick(["last name", "nom de famille"])
+    merge_names = bool(first_c and last_c and first_c != last_c)
+    if merge_names:
+        name_c = None
     url_c = pick(["website", "url", "site", "link", "lien", "href", "web"])
     email_c = pick(["email", "mail", "courriel"])
     phone_c = pick(["phone", "tel", "whatsapp", "mobile", "téléphone"])
+    emp_c = pick(["employees", "employee", "effectif", "taille", "employés", "personnel"])
+    li_c = pick(["linkedin", "profil"])
+    li_c = li_c if li_c and li_c != name_c else None
 
     name_c = name_c or df.columns[0]
     rows: list[dict] = []
@@ -691,8 +1351,12 @@ def parse_csv_leads(uploaded) -> pd.DataFrame:
         email = _norm(row[email_c]) if email_c else ""
         phone = _norm(row[phone_c]) if phone_c else ""
         website = normalize_url(_norm(row[url_c]) if url_c else "")
+        if merge_names:
+            name = f"{_norm(row[first_c])} {_norm(row[last_c])}".strip() or "Sans nom"
+        else:
+            name = _norm(row[name_c]) or "Sans nom"
         rows.append({
-            "name": _norm(row[name_c]) or "Sans nom",
+            "name": name,
             "website": website,
             "email": email,
             "phone": phone,
@@ -702,6 +1366,10 @@ def parse_csv_leads(uploaded) -> pd.DataFrame:
             "snippet": "",
             "audit": "",
             "status": "",
+            "linkedin": normalize_url(_norm(row[li_c])) if li_c else "",
+            "employees": _norm(row[emp_c]) if emp_c else "",
+            "ai_target": "",
+            "ai_audit": "",
         })
     return pd.DataFrame(rows, columns=LEAD_COLS)
 
@@ -761,11 +1429,13 @@ def _available_models_cached(api_key: str) -> list[str]:
 def gemini_generate(api_key: str, model: str, prompt: str,
                     temperature: float = 0.7, max_tokens: int = 700,
                     max_retries: int = 3, base_wait: float = 5.0) -> str:
-    """Appel Gemini avec nouvelle tentative automatique sur 429 / 5xx.
+    """Appel Gemini avec nouvelle tentative automatique sur 429 / 5xx ET bascule
+    automatique sur un autre modèle si le modèle demandé est en quota (429) ou
+    arrêté (404) — ex. quota quotidien gratuit de gemini-3.6-flash épuisé.
 
-    Backoff exponentiel : ~5s, ~12s, ~27s avant d'abandonner. Un 429 persistant
-    après ces essais signifie en général un quota QUOTIDIEN épuisé (plan gratuit).
-    """
+    Backoff exponentiel : ~5s, ~12s, ~27s avant de tenter le modèle suivant.
+    Ordre de repli : GEMINI_MODELS (hors modèle demandé)."""
+    fallback_models = [m for m in GEMINI_MODELS if m != model]
     last_exc: Exception | None = None
     for attempt in range(max_retries + 1):
         try:
@@ -785,8 +1455,40 @@ def gemini_generate(api_key: str, model: str, prompt: str,
             raise RuntimeError("SDK Gemini absent — installez `google-genai` (pip install google-genai).")
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
-            if attempt >= max_retries or not _is_rate_limit(exc):
+            if not _is_rate_limit(exc) and not _is_not_found(exc):
                 raise
+            if attempt >= max_retries:
+                # Modèle indisponible (quota 429 persistant / 404) : bascule automatique
+                # sur un autre modèle de la liste (ex. gemini-3.5-flash).
+                for fb in fallback_models:
+                    try:
+                        if _GENAI_STATE == "new":
+                            client = _genai.Client(api_key=api_key)
+                            resp = client.models.generate_content(
+                                model=fb,
+                                contents=prompt,
+                                config=_genai_types.GenerateContentConfig(
+                                    temperature=temperature, max_output_tokens=max_tokens,
+                                ),
+                            )
+                            text = (resp.text or "").strip()
+                        elif _GENAI_STATE == "legacy":
+                            _genai_legacy.configure(api_key=api_key)
+                            text = _genai_legacy.GenerativeModel(fb).generate_content(prompt).text.strip()
+                        else:
+                            text = ""
+                        if text:
+                            try:
+                                st.toast(f"🔄 Bascule automatique : génération via {fb} "
+                                         f"({model} indisponible/quotas).", icon="🔄")
+                            except Exception:  # noqa: BLE001
+                                pass
+                            return text
+                    except Exception as fb_exc:  # noqa: BLE001
+                        if _is_not_found(fb_exc) or _is_rate_limit(fb_exc):
+                            continue  # ce modèle est aussi indisponible, on essaie le suivant
+                        raise
+                raise last_exc
             wait = base_wait * (2 ** attempt) + random.uniform(0, 2.0)
             try:
                 st.toast(f"⏳ Limite API Gemini (429) — nouvel essai dans {wait:.0f}s "
@@ -814,7 +1516,8 @@ def openai_generate(api_key: str, model: str, prompt: str,
 
 
 def audit_prompt(mode: str, name: str, location: str, snippet: str = "",
-                 segment: str = SEG_NO_SITE, lang: str = "fr", website: str = "") -> str:
+                 segment: str = SEG_NO_SITE, lang: str = "fr", website: str = "",
+                 faille: str = "") -> str:
     """Argumentaire IA personnalisé selon le segment (A: sans site / B: site médiocre),
     avec techniques de copywriting (AIDA / PAS), ton prestigieux et langue FR/EN."""
     en = lang != "fr"
@@ -827,6 +1530,10 @@ def audit_prompt(mode: str, name: str, location: str, snippet: str = "",
                     "modern website design (mobile, WhatsApp, local SEO)"),
         MODE_SEO: L("QR code + avis Google 5 étoiles + fiche Maps optimisée",
                     "QR code + 5-star Google reviews + optimized Maps profile"),
+        MODE_AI: L("installation d'un assistant IA (chatbot) sur le site du prospect — réponse "
+                   "24h/24, qualification des demandes, prise de rendez-vous automatique",
+                   "deploying an AI assistant (chatbot) on the prospect's website — 24/7 "
+                   "answers, lead qualification, automatic booking"),
     }[mode]
 
     if segment == SEG_NO_SITE:
@@ -879,6 +1586,17 @@ def audit_prompt(mode: str, name: str, location: str, snippet: str = "",
         if (snippet and segment == SEG_BAD_SITE) else ""
     )
 
+    faille_line = (
+        L(f"· Faille détectée (scan IA du site) : {faille}.\n",
+          f"· Detected weakness (AI website scan): {faille}.\n")
+        if faille else ""
+    )
+    icp_line = (
+        L("· ICP : PME de 3 à 20 employés (cible idéale).\n",
+          "· ICP: SMEs with 3 to 20 employees (ideal target).\n")
+        if mode == MODE_AI else ""
+    )
+
     return L(
         "Tu es un copywriter senior de très haut niveau. Rédige un argumentaire de vente "
         "PERSONNALISÉ — jamais générique — pour ce prospect. Contraintes impératives :\n"
@@ -889,6 +1607,7 @@ def audit_prompt(mode: str, name: str, location: str, snippet: str = "",
         "· Structure ta réponse en 3 parties : (1) accroche, (2) démonstration, (3) appel à "
         "l'action.\n"
         f"· Ta solution : {service}.\n\n"
+        f"{faille_line}{icp_line}"
         f"Prospect : {angle}\n"
         f"Extrait fourni : « {snippet or 'aucun'} »\n"
         "Réponds en français, ton premium.\n",
@@ -900,6 +1619,7 @@ def audit_prompt(mode: str, name: str, location: str, snippet: str = "",
         "· Do NOT invent precise figures without data; stay qualitative and elegant.\n"
         "· Structure your answer in 3 parts: (1) hook, (2) demonstration, (3) call to action.\n"
         f"· Your solution: {service}.\n\n"
+        f"{faille_line}{icp_line}"
         f"Prospect: {angle}\n"
         f"Provided excerpt: « {snippet or 'none'} »\n"
         "Answer in English, premium tone.\n",
@@ -913,8 +1633,14 @@ def audit_prompt(mode: str, name: str, location: str, snippet: str = "",
 
 def body_to_html(text: str, image_cids: list[str] | None = None,
                  cta: dict | None = None, video: str = "") -> str:
-    """Convertit le corps (texte brut) en email HTML « Luxe » (fond sombre, laiton),
-    avec contenu enrichi optionnel : images (pièces jointes inline cid), bouton CTA, vidéo."""
+    """Convertit le corps (texte brut) en email HTML professionnel CLAIR.
+
+    Thème clair (fond blanc, texte sombre) : lisible partout — Gmail affiche les
+    fonds sombres sur fond blanc en forçant les couleurs, ce qui rend le texte
+    illisible. Un email clair est aussi bien mieux noté par les filtres anti-spam
+    (pas d'image de fond, ratio texte/image élevé, style « courriel pro »).
+    Contenu enrichi optionnel : images (inline cid), bouton CTA doré, vidéo.
+    """
     import html as _html
 
     def _richify(block: str) -> str:
@@ -927,13 +1653,13 @@ def body_to_html(text: str, image_cids: list[str] | None = None,
         block = re.sub(
             r"!\[([^\]]*)\]\((https?://[^)\s]+)\)",
             lambda m: (f'<img src="{m.group(2)}" alt="{m.group(1)}" '
-                       'style="max-width:100%;height:auto;border-radius:10px;'
+                       'style="max-width:100%;height:auto;border-radius:8px;'
                        'margin:0 0 18px 0;display:block;"/>'),
             block)
         block = re.sub(
             r"\[([^\]]+)\]\((https?://[^)\s]+)\)",
             lambda m: (f'<a href="{m.group(2)}" '
-                       'style="color:#D9A441;text-decoration:underline;'
+                       'style="color:#8a6d1f;text-decoration:underline;'
                        f'font-family:Helvetica,Arial,sans-serif;">{m.group(1)}</a>'),
             block)
         return block
@@ -942,39 +1668,40 @@ def body_to_html(text: str, image_cids: list[str] | None = None,
     for block in re.split(r"\n\s*\n", text or ""):
         if block.strip():
             paras.append(
-                f'<p style="margin:0 0 16px 0;line-height:1.7;">{_richify(block)}</p>')
+                f'<p style="margin:0 0 16px 0;line-height:1.7;color:#222222;">{_richify(block)}</p>')
     body = "\n".join(paras) or "<p></p>"
 
     rich: list[str] = []
     for cid in image_cids or []:
         rich.append(
             f'<img src="cid:{cid}" alt="" style="max-width:100%;height:auto;'
-            'border-radius:10px;margin:0 0 18px 0;display:block;"/>')
+            'border-radius:8px;margin:0 0 18px 0;display:block;"/>')
     if cta and cta.get("url"):
         rich.append(
             f'<a href="{_html.escape(str(cta["url"]))}" style="display:inline-block;'
-            'background:linear-gradient(135deg,#EEC06A,#A87F2F);color:#161006;'
-            'text-decoration:none;padding:12px 26px;border-radius:8px;font-weight:700;'
-            'font-family:Helvetica,Arial,sans-serif;margin:6px 0 20px 0;">'
+            'background:#c9a45c;color:#ffffff;text-decoration:none;padding:12px 26px;'
+            'border-radius:6px;font-weight:700;font-family:Helvetica,Arial,sans-serif;'
+            'margin:6px 0 20px 0;">'
             f'{_html.escape(str(cta.get("label") or "En savoir plus"))}</a>')
     if video and str(video).strip():
         rich.append(
             f'<a href="{_html.escape(str(video))}" style="display:inline-block;'
-            'border:1px solid #c9a45c;color:#c9a45c;text-decoration:none;'
-            'padding:12px 26px;border-radius:8px;font-weight:700;'
+            'border:1px solid #c9a45c;color:#8a6d1f;text-decoration:none;'
+            'padding:12px 26px;border-radius:6px;font-weight:700;'
             'font-family:Helvetica,Arial,sans-serif;margin:0 0 20px 0;">'
             '▶️ Regarder la vidéo</a>')
     rich_html = "\n".join(rich)
 
     return (
-        "<div style=\"background:#0d0d0f;padding:32px;font-family:Georgia,'Times New Roman',serif;\">"
-        "<div style=\"max-width:640px;margin:0 auto;background:#16161a;border:1px solid #3a341f;"
-        "border-radius:12px;padding:36px;\">"
-        "<div style=\"color:#c9a45c;font-size:13px;letter-spacing:3px;text-transform:uppercase;"
-        "margin-bottom:18px;\">Scriba Omniscient · Prospection</div>"
+        "<div style=\"background:#f4f4f2;padding:32px 12px;font-family:Helvetica,Arial,sans-serif;\">"
+        "<div style=\"max-width:600px;margin:0 auto;background:#ffffff;border:1px solid #e0e0dc;"
+        "border-radius:10px;padding:36px;\">"
+        "<div style=\"color:#8a6d1f;font-size:12px;letter-spacing:2px;text-transform:uppercase;"
+        "margin-bottom:18px;border-bottom:1px solid #eaeae6;padding-bottom:14px;\">"
+        "Scriba Omniscient · Prospection</div>"
         f"{rich_html}{body}"
-        "<div style=\"margin-top:24px;padding-top:18px;border-top:1px solid #2a2a30;"
-        "color:#8a8a93;font-size:12px;font-family:Helvetica,Arial,sans-serif;\">"
+        "<div style=\"margin-top:24px;padding-top:14px;border-top:1px solid #eaeae6;"
+        "color:#888888;font-size:12px;font-family:Helvetica,Arial,sans-serif;\">"
         "Message professionnel envoyé dans le cadre d'une prospection B2B. Si vous n'êtes pas le "
         "bon interlocuteur, répondez « STOP » pour ne plus être recontacté.</div>"
         "</div></div>"
@@ -983,19 +1710,51 @@ def body_to_html(text: str, image_cids: list[str] | None = None,
 
 def send_via_smtp(sender: str, password: str, to: str, subject: str, body: str,
                   html_body: str | None = None,
-                  images: list[dict] | None = None) -> str:
-    """Envoie un email Gmail via smtplib. `images` = liste de dicts
-    {maintype, subtype, data} attachées en inline (cid: img_0, img_1, …)."""
-    msg = EmailMessage()
-    msg["From"] = sender
+                  images: list[dict] | None = None,
+                  sender_name: str = "") -> str:
+    """Envoie un email Gmail via smtplib (ENVOI RÉEL — pas de simulation).
+
+    `images` = liste de dicts {maintype, subtype, data} attachées en inline
+    (cid: img_0, img_1, …).
+    `sender_name` = nom d'affichage (ex. nom de l'agence) — Gmail l'affiche dans
+    la boîte de réception, ce qui rassure le prospect et améliore le taux d'ouverture.
+
+    Structure MIME : multipart/alternative -> [texte brut, multipart/related ->
+    [HTML + images inline]].  (L'ancienne implémentation utilisait
+    `add_related` APRÈS `add_alternative`, ce qui levait
+    `ValueError: Cannot convert alternative to related` dès qu'une image était
+    jointe — le mail n'était jamais envoyé.)
+
+    Anti-spam : en-têtes propres (From avec nom d'affichage, Reply-To explicite,
+    List-Unsubscribe déclaré) + texte brut + HTML clair. Gmail signe SPF/DKIM
+    automatiquement pour les envois via smtp.gmail.com.
+    """
+    from email.mime.image import MIMEImage
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+
+    display = (str(sender_name or "").strip() or sender)
+    msg = MIMEMultipart("alternative")
+    msg["From"] = f"{display} <{sender}>"
     msg["To"] = to
+    msg["Reply-To"] = sender
     msg["Subject"] = subject
-    msg.set_content(body)
-    if html_body:
-        msg.add_alternative(html_body, subtype="html")
-    for i, img in enumerate(images or []):
-        msg.add_related(img["data"], maintype=img.get("maintype", "image"),
-                        subtype=img.get("subtype", "png"), cid=f"img_{i}")
+    msg["List-Unsubscribe"] = f"<mailto:{sender}?subject=unsubscribe>"
+    msg["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
+    msg.attach(MIMEText(body or "", "plain", "utf-8"))
+    if images:
+        # partie « related » : HTML + images inline (cid: img_0, img_1, …)
+        related = MIMEMultipart("related")
+        related.attach(MIMEText(html_body or body_to_html(body or ""), "html", "utf-8"))
+        for i, img in enumerate(images):
+            subtype = str(img.get("subtype") or "png").lower()
+            part = MIMEImage(img["data"], _subtype=subtype)
+            part.add_header("Content-ID", f"<img_{i}>")
+            part.add_header("Content-Disposition", "inline", filename=f"img_{i}.{subtype}")
+            related.attach(part)
+        msg.attach(related)
+    elif html_body:
+        msg.attach(MIMEText(html_body, "html", "utf-8"))
     ctx = ssl.create_default_context()
     with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx, timeout=30) as server:
         server.login(sender, password)
@@ -1007,6 +1766,137 @@ SMTP_HINT = ("💡 Identifiants Gmail refusés (535). Utilisez un MOT DE PASSE D
              "(jamais votre mot de passe normal) — https://myaccount.google.com/apppasswords. "
              "Vérifiez : validation en 2 étapes activée, code collé SANS espaces, bonne adresse. "
              "Alternative : canal « composio (Gmail OAuth) » dans l'onglet Outreach.")
+
+# --- Multi-comptes Gmail : roulement automatique des expéditeurs + réchauffement ---
+
+# Réchauffement progressif : limite quotidienne par semaine (10 -> 30 -> 60 -> 100 -> …)
+WARMUP_SCHEDULE = [10, 30, 60, 100, 150, 200]
+
+
+def parse_gmail_accounts() -> list[tuple[str, str]]:
+    """Liste des comptes Gmail configurés : [ (email, motdepasse), … ]
+    = compte principal (gmail_user/gmail_pass) + comptes additionnels
+    (champ `gmail_accounts`, un « email:motdepasse » par ligne)."""
+    accounts: list[tuple[str, str]] = []
+    gu = _norm(st.session_state.get("gmail_user", ""))
+    gp = st.session_state.get("gmail_pass", "") or ""
+    if gu and gp:
+        accounts.append((gu, gp))
+    for line in str(st.session_state.get("gmail_accounts", "") or "").splitlines():
+        line = line.strip()
+        if ":" in line:
+            email, pwd = line.split(":", 1)
+            email, pwd = email.strip(), pwd.strip()
+            if email and pwd and (email, pwd) not in accounts:
+                accounts.append((email, pwd))
+    return accounts
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _accounts_status_cached(accounts_tuple: tuple) -> str:
+    """Statut du nombre de comptes configurés (en cache 2 min)."""
+    n = len(accounts_tuple)
+    if n == 0:
+        return "Aucun compte Gmail configuré."
+    return f"{n} compte(s) Gmail prêt(s) — envois répartis automatiquement."
+
+
+_DAILY_LOCK = threading.Lock()
+
+
+def daily_send_limit() -> int:
+    """Limite quotidienne : plan de réchauffement (progressif) ou limite fixe, 0 = illimité."""
+    if not st.session_state.get("warmup_enabled"):
+        try:
+            return max(0, int(st.session_state.get("daily_limit", 0) or 0))
+        except (TypeError, ValueError):
+            return 0
+    start = st.session_state.get("warmup_start", "") or ""
+    d0 = None
+    try:
+        d0 = datetime.strptime(str(start), "%Y-%m-%d").date() if start else None
+    except ValueError:
+        d0 = None
+    if not d0:
+        return WARMUP_SCHEDULE[0]
+    weeks = max(0, (datetime.now().date() - d0).days // 7)
+    if weeks >= len(WARMUP_SCHEDULE):
+        try:
+            return max(0, int(st.session_state.get("daily_limit", 200) or 200))
+        except (TypeError, ValueError):
+            return 200
+    return WARMUP_SCHEDULE[weeks]
+
+
+def daily_sent_count() -> int:
+    """Emails déjà envoyés aujourd'hui (compteur persistant de session)."""
+    key = str(datetime.now().date())
+    return int(st.session_state.get("_daily_sent", {}).get(key, 0))
+
+
+def daily_remaining() -> int:
+    """Emails restants autorisés aujourd'hui (999 999 si illimité)."""
+    limit = daily_send_limit()
+    if limit <= 0:
+        return 999_999
+    return max(0, limit - daily_sent_count())
+
+
+def _account_send_fn(agency: str):
+    """Ferme un expéditeur qui TOURNE sur tous les comptes Gmail configurés
+    (round-robin) et comptabilise les envois dans le quota quotidien.
+    Chaque email part de l'un des comptes — la réputation est répartie."""
+    accounts = parse_gmail_accounts()
+    if not accounts:
+        raise RuntimeError("Aucun compte Gmail configuré (sidebar).")
+    idx = [0]
+
+    def send_fn(item):
+        sender, password = accounts[idx[0] % len(accounts)]
+        idx[0] += 1
+        res = send_via_smtp(sender, password, item["email"], item["subject"],
+                            item["body"], html_body=item.get("html"),
+                            images=item.get("images"), sender_name=agency)
+        with _DAILY_LOCK:
+            _ds = st.session_state.setdefault("_daily_sent", {})
+            key = str(datetime.now().date())
+            _ds[key] = int(_ds.get(key, 0)) + 1
+        return res
+
+    return send_fn
+
+
+def _outreach_queue_cap(queue: list) -> tuple[list, str]:
+    """Réduit la file d'envoi au quota quotidien restant. Retourne (queue, message)."""
+    remaining = daily_remaining()
+    if remaining >= len(queue):
+        return queue, ""
+    note = (f"⚠️ Quota quotidien atteint ({daily_send_limit()} emails/jour) : seuls "
+            f"les {remaining} premiers emails seront envoyés aujourd'hui. Relancez "
+            "demain pour continuer (réchauffement progressif).")
+    return queue[:remaining], note
+
+# Mots déclencheurs de spam à éviter dans l'objet / le corps (FR + EN).
+# Un email de prospection sobre et personnel passe mieux les filtres Gmail.
+SPAM_TRIGGERS = [
+    "gratuit", "free", "offre exceptionnelle", "offre limitée", "dernière chance",
+    "urgent", "action urgente", "100%", "100 %", "gagné", "win", "$$$", "prix cassé",
+    "promotion", "cliquez ici", "click here", "en ligne maintenant", "viagra",
+    "cash", "money", "million", "gagner de l'argent", "make money", "deal incroyable",
+    "sans risque", "risk free", "test gratuit", "essai gratuit", "répondez vite",
+    "act now", "bonus", "réduction massive", "prix imbattable", "meilleure offre",
+    "cliquez maintenant", "actuellement en promotion", "-%", "-%", "offre spéciale",
+]
+
+
+def spam_risk_warning(subject: str, body: str = "") -> list[str]:
+    """Liste les mots déclencheurs de spam trouvés dans l'objet/corps (vide si propre)."""
+    hay = f"{subject or ''} {body or ''}".lower()
+    found = []
+    for w in SPAM_TRIGGERS:
+        if w.lower() in hay:
+            found.append(w)
+    return found
 
 
 def _is_bad_credentials(exc: Exception) -> bool:
@@ -1071,15 +1961,22 @@ def send_via_composio(api_key: str, to: str, subject: str, body: str) -> str:
 # ------------------------------------------------------------------
 
 
-def payment_block(mode: str, iban: str, africa_payment: str) -> str:
-    if mode == MODE_COPY:
+def payment_block(mode: str, iban: str, africa_payment: str, country: str = "") -> str:
+    is_africa = bool(country) and _norm_key(country) in _AFRICAN_NORM
+    if mode == MODE_COPY and not is_africa:
         if iban.strip():
             return (f"Paiement sécurisé par virement SEPA — IBAN (Grey.co) : {iban.strip()}. "
                     "Facture professionnelle fournie.")
         return ("Paiement sécurisé par virement SEPA via Grey.co (IBAN communiqué sur demande). "
                 "Facture professionnelle fournie.")
-    return (f"Paiement flexible en 2 tranches : {africa_payment.strip() or DEFAULT_AFRICA_PAYMENT}. "
-            "Réduction si paiement comptant.")
+    if is_africa or mode in (MODE_WEB, MODE_SEO):
+        return (f"Paiement flexible en 2 tranches : {africa_payment.strip() or DEFAULT_AFRICA_PAYMENT}. "
+                "Réduction si paiement comptant.")
+    if iban.strip():
+        return (f"Paiement sécurisé par virement SEPA — IBAN (Grey.co) : {iban.strip()}. "
+                "Facture professionnelle fournie.")
+    return ("Paiement sécurisé par virement SEPA via Grey.co (IBAN communiqué sur demande). "
+            "Facture professionnelle fournie.")
 
 
 def fill_template(template: str, lead: pd.Series | dict, agency: str, location: str,
@@ -1426,6 +2323,33 @@ def inject_css() -> None:
 # ------------------------------------------------------------------
 
 
+def _normalize_leads_index() -> None:
+    """Garantit un index UNIQUE (RangeIndex) sur `leads` / `leads_edit`.
+
+    L'éditeur de données dynamique (num_rows="dynamic") peut produire des index
+    dupliqués ou None quand des lignes sont ajoutées : deux leads partagent alors
+    le même index, ce qui casse les clés de widgets basées sur l'index
+    (ex. StreamlitDuplicateElementKey 'snippet_20' dans l'onglet Audit).
+    La sélection ✓ est repositionnelle et préservée.
+    """
+    leads = st.session_state.get("leads")
+    if leads is None or leads.empty:
+        return
+    if leads.index.is_unique and not any(v is None for v in leads.index):
+        return  # déjà propre
+    sel = None
+    edit = st.session_state.get("leads_edit")
+    if edit is not None and not edit.empty and SEL_COL in edit.columns \
+            and len(edit) == len(leads):
+        sel = edit[SEL_COL].fillna(False).astype(bool).tolist()
+    st.session_state["leads"] = leads.reset_index(drop=True)
+    new_edit = st.session_state["leads"].copy()
+    new_edit[SEL_COL] = sel if sel is not None else False
+    st.session_state["leads_edit"] = new_edit
+    st.session_state["edit_version"] = -1  # force le data_editor à repartir des données
+    st.session_state["leads_version"] = st.session_state.get("leads_version", 0) + 1
+
+
 def init_session() -> None:
     st.session_state.setdefault("leads", empty_leads())
     st.session_state.setdefault("leads_edit", empty_leads())
@@ -1449,13 +2373,50 @@ def init_session() -> None:
     st.session_state.setdefault("lang", "fr")
     st.session_state.setdefault("campaign_stats",
                                 {"contacted": 0, "wa": 0, "mail": 0, "fail": 0, "history": []})
+    st.session_state.setdefault("campaigns", [])
+    st.session_state.setdefault("responses", {})
+    st.session_state.setdefault("tracked_clicks", 0)
+    st.session_state.setdefault("ln_niche", "")
+    st.session_state.setdefault("ln_city", "")
+    st.session_state.setdefault("lang_en", False)
+    st.session_state.setdefault("africa_payment", DEFAULT_AFRICA_PAYMENT)
 
-    # Réparation des données héritées d'une session plus ancienne (sans colonne segment)
+    # --- v6 : chargement automatique des champs depuis settings.json (ZÉRO perte) ---
+    loaded = load_settings()
+    for k, v in loaded.items():
+        if v is None or k not in SETTINGS_KEYS:
+            continue
+        st.session_state.setdefault(k, v)
+    # warmup_start est stocké en ISO (str) dans settings.json → reconverti en date
+    _ws = st.session_state.get("warmup_start")
+    if isinstance(_ws, str) and _ws:
+        try:
+            st.session_state["warmup_start"] = datetime.strptime(_ws, "%Y-%m-%d").date()
+        except ValueError:
+            st.session_state["warmup_start"] = datetime.now().date()
+    if "_daily_sent" not in st.session_state:
+        st.session_state["_daily_sent"] = {}
+    if "fr_country" not in loaded:
+        saved_country = _norm_key(loaded.get("country", ""))
+        if saved_country:
+            match = next((lab for lab, info in FRANCO_COUNTRIES.items()
+                          if _norm_key(info["country"]) == saved_country), None)
+            st.session_state.setdefault("fr_country", match or "✍️ Autre / libre")
+        else:
+            st.session_state.setdefault("fr_country", "France")
+    st.session_state.setdefault("_fr_prev", st.session_state.get("fr_country"))
+
+    # Réparation des données héritées d'une session plus ancienne : colonnes manquantes
+    # (segment v1 → linkedin/employees/ai_target/ai_audit v6)
     for dfk in ("leads", "leads_edit"):
         df = st.session_state.get(dfk)
-        if df is not None and "segment" not in df.columns:
-            st.session_state[dfk]["segment"] = (
-                df["website"].map(classify_segment).fillna(SEG_NO_SITE))
+        if df is None:
+            continue
+        if "segment" not in df.columns:
+            df["segment"] = df["website"].map(classify_segment).fillna(SEG_NO_SITE)
+        for col in ("linkedin", "employees", "ai_target", "ai_audit"):
+            if col not in df.columns:
+                df[col] = ""
 
 
 def _lang_templates(mode: str, lang: str) -> tuple[str, str]:
@@ -1526,6 +2487,20 @@ def render_sidebar() -> None:
         )
 
         st.markdown("### ⚙️ Identité")
+        logo_up = st.file_uploader("Logo (optionnel)", type=["png", "jpg", "jpeg", "webp"],
+                                   key="logo_up", help="Enregistré en permanence (logo.png) et "
+                                   "affiché dans la barre latérale.")
+        if logo_up is not None:
+            try:
+                _logo_path = Path(__file__).resolve().parent / "logo.png"
+                _data = logo_up.getvalue()
+                if not _logo_path.exists() or _logo_path.read_bytes() != _data:
+                    _logo_path.write_bytes(_data)
+                    st.toast("Logo enregistré ✓", icon="🖼️")
+            except Exception:  # noqa: BLE001
+                pass
+        if Path(__file__).resolve().parent.joinpath("logo.png").exists():
+            st.image(str(Path(__file__).resolve().parent / "logo.png"), width=130)
         st.text_input("Nom de l'agence", key="agency", placeholder="Scriba & Co")
         st.text_input("Clé API Gemini (moteur principal, gratuit)", type="password", key="gemini_key",
                       help="https://aistudio.google.com/apikey — audits IA et génération de textes.")
@@ -1546,6 +2521,18 @@ def render_sidebar() -> None:
                     st.success(msg_t)
                 else:
                     st.error(msg_t)
+            st.divider()
+            st.caption("**🚀 Comptes Gmail supplémentaires (roulement)** — un « email:motdepasse "
+                       "d'application » par ligne. Les envois sont répartis automatiquement "
+                       "entre tous les comptes (réputation + volume multipliés).")
+            st.text_area("Comptes additionnels (email:motdepasse par ligne)",
+                         key="gmail_accounts", height=90,
+                         placeholder="agence1@gmail.com:abcd efgh ijkl mnop\nagence2@gmail.com:wxyz …")
+            _accs = parse_gmail_accounts()
+            if _accs:
+                st.success(_accounts_status_cached(tuple(_accs)))
+            else:
+                st.warning("Aucun compte Gmail configuré — les envois email sont désactivés.")
         st.text_input("Clé API Composio (optionnel)", type="password", key="composio_key",
                       help="composio.dev — Gmail via OAuth, remplace smtplib")
         if st.session_state.get("composio_key"):
@@ -1559,7 +2546,7 @@ def render_sidebar() -> None:
                        "OpenAI. Gemini reste le moteur principal (gratuit).")
             st.text_input("Clé API OpenAI", type="password", key="openai_key",
                           help="https://platform.openai.com/api-keys")
-            st.selectbox("Modèle OpenAI", OPENAI_MODELS, index=0, key="openai_model")
+            st.selectbox("Modèle OpenAI", OPENAI_MODELS, key="openai_model")
 
         st.markdown("### 🎯 Mode")
         st.selectbox("Modèle d'affaires", MODES, key="mode",
@@ -1569,7 +2556,6 @@ def render_sidebar() -> None:
         st.markdown("### 🌐 Langue de génération")
         st.toggle(
             "FRANÇAIS / ENGLISH",
-            value=(st.session_state.get("lang", "fr") == "en"),
             key="lang_en",
             help="Change instantanément la langue de génération des messages : audits IA, "
                  "emails et WhatsApp (modèles par défaut). Vos messages personnalisés sont "
@@ -1586,6 +2572,23 @@ def render_sidebar() -> None:
             st.session_state["prev_msg_lang"] = lang
 
         st.markdown("### 📍 Localisation")
+        st.selectbox("Pays (zone francophone)", FRANCO_LABELS, key="fr_country",
+                     help="Sélectionnez un pays francophone : le pays, la région DuckDuckGo et le "
+                          "ton des messages IA s'adaptent automatiquement. « ✍️ Autre / libre » "
+                          "laisse le champ Pays totalement libre.")
+        _frc = st.session_state.get("fr_country", "")
+        if _frc and _frc != "✍️ Autre / libre":
+            _finfo = FRANCO_COUNTRIES[_frc]
+            if st.session_state.get("_fr_prev") != _frc:
+                # Changement de pays : met à jour pays / ville suggérée / région DDG
+                st.session_state["country"] = _finfo["country"]
+                if not st.session_state.get("city"):
+                    st.session_state["city"] = _finfo["cities"][0]
+                st.session_state["ddg_region"] = _finfo["region"]
+                st.session_state["_fr_prev"] = _frc
+            st.caption("Villes suggérées : " + ", ".join(_finfo["cities"][:6]))
+        else:
+            st.session_state["_fr_prev"] = _frc or ""
         c1, c2 = st.columns(2)
         c1.text_input("Ville", key="city", placeholder="Lomé")
         c2.text_input("Pays", key="country", placeholder="Togo")
@@ -1593,7 +2596,27 @@ def render_sidebar() -> None:
         st.markdown("### 💰 Paiement & confiance")
         st.text_input("IBAN (Grey.co) — emails EU", key="iban", placeholder="FR76 1234 …")
         st.text_area("Split T-Money / Flooz — clients Afrique",
-                     value=DEFAULT_AFRICA_PAYMENT, key="africa_payment", height=70)
+                     key="africa_payment", height=70)
+
+        st.markdown("### 🚦 Quota quotidien & réchauffement")
+        st.caption("Protège votre réputation d'expéditeur : Gmail limite à ~500 emails/jour "
+                   "par compte, et un volume soudain = spam. Le réchauffement augmente "
+                   "progressivement la limite (10 → 30 → 60 → … → 200/jour).")
+        cw1, cw2 = st.columns(2)
+        cw1.toggle("Plan de réchauffement", key="warmup_enabled",
+                   help="Active la montée en volume progressive (2-4 semaines conseillées).")
+        cw2.number_input("Limite fixe / max (emails/jour)", 0, 5000, 200, key="daily_limit",
+                         help="0 = illimité (déconseillé). Limite maximale après réchauffement.")
+        st.date_input("Date de début du réchauffement", key="warmup_start",
+                      value=datetime.now().date(),
+                      help="Jour 1 du réchauffement — la limite monte chaque semaine.")
+        _lim = daily_send_limit()
+        _used = daily_sent_count()
+        if _lim > 0:
+            st.progress(min(1.0, _used / _lim if _lim else 0),
+                        text=f"Aujourd'hui : {_used} / {_lim} emails envoyés")
+        else:
+            st.caption(f"Aujourd'hui : {_used} emails envoyés (illimité)")
 
         if st.button("🧹 Réinitialiser la session"):
             for k in list(st.session_state.keys()):
@@ -1615,8 +2638,7 @@ def render_discovery_tab() -> None:
         sector_labels = [s["label"] for s in SECTORS[mode]]
         st.multiselect("Secteurs", options=sector_labels, key="sectors_sel")
         c1, c2, c3 = st.columns([2, 2, 1])
-        region = c1.selectbox("Région de recherche", ["fr-fr", "en-gb", "de-de", "wt-wt", "us-en"],
-                              index=0, key="ddg_region")
+        region = c1.selectbox("Région de recherche", REGIONS, key="ddg_region")
         max_res = c2.number_input("Résultats par requête", 5, 50, 10, key="ddg_max")
         launch = c3.button("🔍 Lancer", type="primary", use_container_width=True)
 
@@ -1640,9 +2662,10 @@ def render_discovery_tab() -> None:
                 finally:
                     prog.empty()
 
-    with st.expander("📄 Importer un CSV (Instant Data Scraper)", expanded=True):
-        uploaded = st.file_uploader("Fichier CSV", type=["csv"], key="csv_up")
-        if uploaded and st.button("📥 Importer le CSV", type="secondary"):
+    with st.expander("📄 Importer des leads (CSV)", expanded=True):
+        uploaded = st.file_uploader("Fichier CSV ou Excel", type=["csv", "txt", "xlsx", "xls"], key="csv_up",
+                                    help="Exports Instant Data Scraper, Excel/Windows et CSV séparés par virgule, point-virgule ou tabulation.")
+        if uploaded and st.button("📥 Importer le fichier", type="secondary"):
             try:
                 df = parse_csv_leads(uploaded)
                 if st.session_state["leads"].empty:
@@ -1654,6 +2677,91 @@ def render_discovery_tab() -> None:
                 st.toast(f"{len(df)} leads importées ✓", icon="📥")
             except Exception as exc:  # noqa: BLE001
                 st.error(f"CSV illisible : {exc}")
+
+    with st.expander("🎯 LinkedIn Sniper — profils décideurs (Google Dorking)", expanded=False):
+        st.caption("Recherche gratuite (DuckDuckGo) de profils de gérants / décideurs via "
+                   "`site:linkedin.com/in/` + niche + ville. Les profils trouvés sont ajoutés "
+                   "dans la colonne « LinkedIn » et en leads dédiées (source LinkedIn).")
+        l1, l2, l3 = st.columns([2, 1, 1])
+        niche = l1.text_input("Niche / fonction (ex : gérant, directeur commercial, fondateur)",
+                              key="ln_niche", placeholder="gérant")
+        ln_city = l2.text_input("Ville", key="ln_city", placeholder="Lomé")
+        ln_max = l3.number_input("Profils max", 3, 30, 10, key="ln_max")
+        if st.button("🎯 Lancer le LinkedIn Sniper", type="primary"):
+            if not _DDGS_AVAILABLE:
+                st.error("`ddgs` absent — `pip install ddgs` puis relancez l'app.")
+            else:
+                q_city = (ln_city or "").strip() or (st.session_state.get("city", "") or "").strip()
+                with st.spinner("LinkedIn Sniper en action…"):
+                    try:
+                        profils = search_linkedin_profiles(
+                            niche, q_city, st.session_state.get("country", ""),
+                            st.session_state.get("ddg_region", "wt-wt"), int(ln_max))
+                    except Exception as exc:  # noqa: BLE001
+                        st.error(f"Erreur LinkedIn Sniper : {exc}")
+                        profils = []
+                if not profils:
+                    st.info("Aucun profil LinkedIn trouvé — élargissez la niche ou changez de "
+                            "région de recherche.")
+                else:
+                    rows = []
+                    for p in profils:
+                        rows.append({"name": p["name"], "website": "", "email": "", "phone": "",
+                                     "source": "LinkedIn", "flag": "Profil décideur",
+                                     "segment": SEG_NO_SITE, "snippet": p.get("title", ""),
+                                     "audit": "", "status": "", "linkedin": p["url"],
+                                     "employees": "", "ai_target": "", "ai_audit": ""})
+                    new_df = pd.DataFrame(rows, columns=LEAD_COLS)
+                    existing = st.session_state["leads"]
+                    # Associe les profils aux leads existantes par similarité de nom
+                    for _, nr in new_df.iterrows():
+                        nm = _norm_key(nr["name"])
+                        if not nm:
+                            continue
+                        m = existing["name"].map(lambda x: nm == _norm_key(x) or nm in _norm_key(x))
+                        if bool(m.any()) and "linkedin" in existing.columns:
+                            existing.loc[m, "linkedin"] = nr["linkedin"]
+                    st.session_state["leads"] = (pd.concat([existing, new_df], ignore_index=True)
+                                                  if not existing.empty else new_df)
+                    st.session_state["leads_version"] += 1
+                    st.toast(f"{len(profils)} profil(s) LinkedIn ajouté(s) ✓", icon="🎯")
+
+    with st.expander("🤖 Audit IA des sites — Cible Prioritaire IA (MaisonNova)", expanded=False):
+        st.caption("Balayage HTML automatique (BeautifulSoup, parallélisé) : détecte l'absence "
+                   "d'IA/chatbot (chatbot, assistant, IA, AI, Intercom, Crisp) et la présence "
+                   "d'un formulaire ou du mot « Contact ». Les leads correspondantes sont "
+                   "marquées « Cible Prioritaire IA » (colonne dédiée).")
+        aa_scope = st.radio("Portée de l'audit",
+                            ["Toutes les leads", "Leads avec site web",
+                             "🎯 Sélection actuelle (✓ / filtre)"],
+                            index=1, horizontal=True, key="ai_audit_scope")
+        aa_workers = st.number_input("Parallélisme (workers)", 1, 16, 8, key="ai_audit_workers",
+                                     help="Scans simultanés — ~40 Mo par worker, restez sous 8 Go.")
+        if st.button("⚡ Lancer l'audit IA des sites", type="primary"):
+            scope_df = st.session_state["leads"]
+            if aa_scope == "Leads avec site web":
+                scope_df = scope_df[scope_df["website"].map(has_website)]
+            elif aa_scope == "🎯 Sélection actuelle (✓ / filtre)":
+                scope_df, _ = _outreach_plan(scope_df)
+            if scope_df.empty:
+                st.warning("Aucune lead dans le périmètre choisi.")
+            else:
+                prog = st.progress(0.0, text="Scan HTML des sites…")
+                try:
+                    new_df = audit_ai_batch(scope_df,
+                                            progress_cb=lambda p: prog.progress(
+                                                p, text="Scan HTML des sites…"),
+                                            max_workers=int(aa_workers))
+                    for col in ("ai_target", "ai_audit"):
+                        st.session_state["leads"].loc[new_df.index, col] = new_df[col]
+                    n_target = int((new_df["ai_target"].astype(str).str.contains("Oui")).sum())
+                    st.session_state["leads_version"] += 1
+                    st.toast(f"{len(new_df)} site(s) scanné(s) — "
+                             f"{n_target} cible(s) prioritaire(s) IA ✓", icon="⚡")
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"Erreur audit IA : {exc}")
+                finally:
+                    prog.empty()
 
     st.markdown("### 📋 Table des leads")
     leads = st.session_state["leads"]
@@ -1723,6 +2831,10 @@ def render_discovery_tab() -> None:
             "snippet": st.column_config.TextColumn("Extrait", width="small"),
             "audit": st.column_config.TextColumn("Audit", width="small"),
             "status": st.column_config.TextColumn("Statut", width="small"),
+            "linkedin": st.column_config.TextColumn("LinkedIn (décideur)", width="medium"),
+            "employees": st.column_config.TextColumn("Employés", width="small"),
+            "ai_target": st.column_config.TextColumn("Cible IA", width="small"),
+            "ai_audit": st.column_config.TextColumn("Audit IA", width="medium"),
         },
     )
 
@@ -1789,6 +2901,9 @@ def _save_audit(key: str) -> None:
 
 def render_audit_tab() -> None:
     st.markdown("### 🧠 AI Audit Engine")
+    # Index unique garanti : les lignes ajoutées dans l'éditeur dynamique peuvent
+    # dupliquer l'index (ex. deux leads d'index 20) -> clés de widgets en collision.
+    _normalize_leads_index()
     leads = st.session_state["leads"]
     if leads.empty:
         st.info("Aucune lead — commencez par l'onglet Discovery.")
@@ -1838,24 +2953,36 @@ def render_audit_tab() -> None:
     )
     # Sécurité : on ne garde que les leads réellement dans le filtre actif — une sélection
     # faite avant d'appliquer le filtre (ou héritée d'une ancienne session) ne doit jamais
-    # permettre d'auditer des leads hors filtre.
+    # permettre d'auditer des leads hors filtre. On DÉDUPLIQUE aussi : la sélection stockée
+    # (audit_sel) peut contenir des doublons hérités d'un état précédent — sans cette étape,
+    # deux widgets partagent la même clé (StreamlitDuplicateElementKey 'snippet_20').
     allowed = set(opts)
-    selected = [i for i in selected if i in allowed]
+    selected = list(dict.fromkeys(i for i in selected if i in allowed))
 
     need_snippets = [i for i in selected
-                     if mode == MODE_COPY or str(leads.loc[i].get("segment", "")) == SEG_BAD_SITE]
+                     if mode in (MODE_COPY, MODE_AI)
+                     or str(leads.loc[i].get("segment", "")) == SEG_BAD_SITE]
+    # Clés uniques PAR POSITION : même si deux leads partageaient le même index
+    # (données héritées), chaque widget a une clé distincte. La même map sert à la
+    # boucle de génération (lecture de l'extrait saisi / récupéré).
+    snippet_key: dict = {i: f"snippet_{_pos}_{i}" for _pos, i in enumerate(need_snippets)}
+    # Extraits récupérés AUTOMATIQUEMENT (bouton « Générer » sans saisie manuelle).
+    # Stockés HORS des clés de widgets : écrire dans st.session_state[_sk] après
+    # l'instanciation du text_area lève StreamlitAPIException.
+    auto_snippets: dict = st.session_state.setdefault("_auto_snippets", {})
     if need_snippets:
-        st.markdown("#### Extraits de sites (Copywriting / Segment B — critique IA)")
+        st.markdown("#### Extraits de sites (Copywriting / IA / Segment B — critique IA)")
         for i in need_snippets:
+            _sk = snippet_key[i]
             with st.expander(f"✂️ Extrait pour « {leads.loc[i, 'name']} »", expanded=False):
                 col1, col2 = st.columns([3, 1])
                 st.text_area(
-                    "Texte / description du site", key=f"snippet_{i}", height=110,
+                    "Texte / description du site", key=_sk, height=110,
                     placeholder="Collez un extrait (ou récupérez-le du site) : l'IA le critiquera "
                                 "pour le Segment B, ou s'en inspirera en mode Copywriting.",
                 )
-                col2.button("🔎 Récupérer du site", key=f"fetch_{i}", on_click=_fetch_snippet_cb,
-                            args=(i,))
+                col2.button("🔎 Récupérer du site", key=f"fetch_{_sk}",
+                            on_click=_fetch_snippet_cb, args=(i, _sk))
                 _flush_outcome()
 
     if st.button("✨ Générer les audits IA", type="primary", disabled=not selected):
@@ -1869,14 +2996,24 @@ def render_audit_tab() -> None:
                 key = lead_key(row)
                 seg = str(row.get("segment", "")) or SEG_NO_SITE
                 snippet = ""
-                if mode == MODE_COPY or seg == SEG_BAD_SITE:
-                    snippet = (st.session_state.get(f"snippet_{i}", "") or "").strip()
+                if mode in (MODE_COPY, MODE_AI) or seg == SEG_BAD_SITE:
+                    _sk = snippet_key.get(i)
+                    snippet = (st.session_state.get(_sk, "") or "").strip() if _sk else ""
+                    if not snippet and _sk:
+                        snippet = (auto_snippets.get(_sk, "") or "").strip()
                     if not snippet and row.get("snippet"):
                         snippet = str(row["snippet"])
+                    if not snippet and has_website(str(row.get("website", "") or "")):
+                        # Contenu RÉEL du site récupéré automatiquement — l'audit
+                        # Gemini travaille sur le site, pas sur un texte générique.
+                        snippet = fetch_snippet(str(row["website"]))
+                        if snippet and _sk:
+                            auto_snippets[_sk] = snippet  # hors widget -> pas d'exception
                 location = f"{st.session_state.get('city', '')} {st.session_state.get('country', '')}".strip()
+                faille = str(row.get("ai_audit", "") or "") if mode == MODE_AI else ""
                 prompt = audit_prompt(mode, str(row["name"]), location or "…", snippet,
                                       segment=seg, lang=st.session_state.get("lang", "fr"),
-                                      website=str(row.get("website", "")))
+                                      website=str(row.get("website", "")), faille=faille)
                 used_model = model
                 text = ""
                 try:
@@ -2030,11 +3167,78 @@ def _improve_wa_openai() -> None:
         st.session_state["_out_error"] = f"Échec OpenAI : {exc}"
 
 
-def _fetch_snippet_cb(i: int) -> None:
+def _gen_email_gemini_cb() -> None:
+    """Gemini rédige 100 % de l'email (objet + corps) : ton du pays + faille détectée."""
+    leads = st.session_state.get("leads")
+    if leads is None or leads.empty:
+        st.session_state["_out_error"] = "Importez d'abord des leads (onglet Discovery)."
+        return
+    api_key = st.session_state.get("gemini_key", "")
+    if not api_key:
+        st.session_state["_out_error"] = "Renseignez la clé Gemini dans la barre latérale."
+        return
+    target, _ = _outreach_plan(leads)
+    row = target.iloc[0] if not target.empty else leads.iloc[0]
+    mode = st.session_state["mode"]
+    audit = st.session_state["audits"].get(lead_key(row), "")
+    faille = str(row.get("ai_audit", "") or "") or audit or ""
+    try:
+        subj, body = personalize_email(
+            mode, st.session_state.get("agency", ""), st.session_state.get("city", ""),
+            st.session_state.get("country", ""), st.session_state.get("lang", "fr"), row,
+            audit=audit, faille=faille, api_key=api_key,
+            model=st.session_state.get("gemini_model") or GEMINI_MODELS[0])
+        st.session_state["email_subject"] = subj
+        st.session_state["email_body"] = body
+        st.session_state["_out_toast"] = "Email généré par Gemini ✓ (ton adapté au pays)"
+    except Exception as exc:  # noqa: BLE001
+        st.session_state["_out_error"] = f"Échec génération : {exc}"
+
+
+def _gen_wa_gemini_cb() -> None:
+    """Gemini rédige le message WhatsApp : ton du pays + faille détectée."""
+    leads = st.session_state.get("leads")
+    if leads is None or leads.empty:
+        st.session_state["_out_error"] = "Importez d'abord des leads (onglet Discovery)."
+        return
+    api_key = st.session_state.get("gemini_key", "")
+    if not api_key:
+        st.session_state["_out_error"] = "Renseignez la clé Gemini dans la barre latérale."
+        return
+    target, _ = _outreach_plan(leads)
+    row = target.iloc[0] if not target.empty else leads.iloc[0]
+    mode = st.session_state["mode"]
+    audit = st.session_state["audits"].get(lead_key(row), "")
+    faille = str(row.get("ai_audit", "") or "") or audit or ""
+    try:
+        st.session_state["wa_msg"] = personalize_wa(
+            mode, st.session_state.get("agency", ""), st.session_state.get("city", ""),
+            st.session_state.get("country", ""), st.session_state.get("lang", "fr"), row,
+            faille=faille, api_key=api_key,
+            model=st.session_state.get("gemini_model") or GEMINI_MODELS[0])
+        st.session_state["_out_toast"] = "Message WhatsApp généré par Gemini ✓ (ton adapté au pays)"
+    except Exception as exc:  # noqa: BLE001
+        st.session_state["_out_error"] = f"Échec génération : {exc}"
+
+
+def _gen_both_gemini_cb() -> None:
+    """Gemini rédige l'email ET le message WhatsApp en un seul clic (templates complets)."""
+    # L'email d'abord : ses placeholders servent de base au message WhatsApp
+    _gen_email_gemini_cb()
+    if st.session_state.get("_out_error"):
+        return  # l'erreur de l'email est déjà signalée, on ne masque pas
+    _gen_wa_gemini_cb()
+    if not st.session_state.get("_out_error"):
+        st.session_state["_out_toast"] = ("Email + WhatsApp générés par Gemini ✓ "
+                                           "(ton adapté au pays, placeholders conservés)")
+
+
+def _fetch_snippet_cb(i: int, widget_key: str = "") -> None:
+    """Récupère le contenu réel du site dans l'extrait de la lead (clé de widget passée)."""
     site = st.session_state["leads"].loc[i, "website"]
     got = fetch_snippet(site)
     if got:
-        st.session_state[f"snippet_{i}"] = got
+        st.session_state[widget_key or f"snippet_{i}"] = got
     else:
         st.session_state["_out_error"] = "Aucun extrait exploitable sur ce site (JS ?)."
 
@@ -2092,6 +3296,12 @@ def render_outreach_tab() -> None:
                 st.session_state["prev_lang"] = lang
         subject = st.text_input("Objet de l'email", key="email_subject")
         body = st.text_area("Corps du message (placeholders)", key="email_body", height=300)
+        _spam = spam_risk_warning(subject, body)
+        if _spam:
+            st.warning(f"⚠️ Mots à risque de spam détectés : **{', '.join(_spam)}**. "
+                       "Remplacez-les pour éviter le dossier spam (ex. « gratuit », « offre "
+                       "exceptionnelle », « urg », « 100% »). Un email sobre et personnalisé "
+                       "passe mieux les filtres Gmail.")
         st.caption(f"Template libre : écrivez l'objet et le corps avec les accolades "
                    f"{PLACEHOLDERS} — remplacées automatiquement par les infos du client à l'envoi. "
                    "Toute colonne de la lead fonctionne aussi en placeholder — ex. **{{Phone}}**, "
@@ -2121,6 +3331,20 @@ def render_outreach_tab() -> None:
                   help="Réécrit votre email via OpenAI (optionnel — Gemini reste le moteur "
                        "principal, gratuit).",
                   on_click=_improve_email_openai)
+        g1, g2 = st.columns([1, 1])
+        g1.button("✨ Générer l'email avec Gemini (ton du pays + faille détectée)",
+                  use_container_width=True, key="gen_email_btn",
+                  on_click=_gen_email_gemini_cb,
+                  disabled=not bool(st.session_state.get("gemini_key")),
+                  help="L'IA (Gemini Flash) rédige 100 % de l'email — objet + corps — adapté au "
+                       "pays cible (formel en France, plus chaleureux au Togo…) et au constat "
+                       "réel du site (audit / contenu récupéré). Placeholders {…} conservés.")
+        g2.button("🤖 Générer email + WhatsApp (un clic)",
+                  use_container_width=True, key="gen_both_btn",
+                  on_click=_gen_both_gemini_cb,
+                  disabled=not bool(st.session_state.get("gemini_key")),
+                  help="Gemini rédige en un seul clic le template d'email (objet + corps) ET le "
+                       "message WhatsApp — 100 % personnalisés, placeholders {…} conservés.")
         _flush_outcome()
 
         # --- Contenu enrichi : image(s), lien CTA, vidéo -----------------------
@@ -2158,12 +3382,14 @@ def render_outreach_tab() -> None:
             row = target.iloc[0]
             audit = st.session_state["audits"].get(lead_key(row), "")
             payment = payment_block(mode, st.session_state.get("iban", ""),
-                                    st.session_state.get("africa_payment", "")) if payment_on else ""
-            preview = fill_template(body, row, st.session_state.get("agency", ""),
-                                    f"{st.session_state.get('city','')} {st.session_state.get('country','')}".strip(),
-                                    mode, audit, payment)
+                                    st.session_state.get("africa_payment", ""),
+                                    st.session_state.get("country", "")) if payment_on else ""
+            loc = f"{st.session_state.get('city','')} {st.session_state.get('country','')}".strip()
+            agency = st.session_state.get("agency", "")
+            preview = fill_template(body, row, agency, loc, mode, audit, payment)
+            preview_subject = fill_template(subject, row, agency, loc, mode)
             with st.expander("Aperçu (1ʳᵉ lead)", expanded=True):
-                st.markdown(f"**Objet :** {subject}")
+                st.markdown(f"**Objet :** {preview_subject}")
                 st.divider()
                 st.write(preview)
 
@@ -2201,6 +3427,11 @@ def render_outreach_tab() -> None:
                     st.warning(msg)
 
             running = bool(st.session_state.get("out_thread") and st.session_state["out_thread"].is_alive())
+            _spam_send = spam_risk_warning(subject, body)
+            if _spam_send:
+                st.warning(f"⚠️ {len(_spam_send)} mot(s) à risque de spam dans le template : "
+                           f"**{', '.join(_spam_send)}**. Vous pouvez envoyer quand même, mais "
+                           "le risque de finir en spam est élevé.")
             b1, b2 = st.columns(2)
             if b1.button("▶️ Lancer la campagne", type="primary", use_container_width=True,
                          disabled=running or not recipients):
@@ -2209,12 +3440,14 @@ def render_outreach_tab() -> None:
                     if not st.session_state.get("composio_key"):
                         st.error("Renseignez la clé Composio (sidebar) — puis connectez Gmail sur composio.dev.")
                         creds_ok = False
-                elif not st.session_state.get("gmail_user") or not st.session_state.get("gmail_pass"):
-                    st.error("Renseignez les credentials Gmail (sidebar) — ou passez en canal Composio.")
+                elif not parse_gmail_accounts():
+                    st.error("Renseignez au moins un compte Gmail (sidebar : adresse + mot de passe "
+                             "d'application, ou comptes additionnels).")
                     creds_ok = False
                 if creds_ok:
                     payment = payment_block(mode, st.session_state.get("iban", ""),
-                                            st.session_state.get("africa_payment", "")) if payment_on else ""
+                                            st.session_state.get("africa_payment", ""),
+                                            st.session_state.get("country", "")) if payment_on else ""
                     img_list = st.session_state.get("email_images_data") or []
                     cids = [f"img_{i}" for i in range(len(img_list))]
                     cta_url = (st.session_state.get("email_cta_url") or "").strip()
@@ -2223,16 +3456,16 @@ def render_outreach_tab() -> None:
                                      or "En savoir plus"} if cta_url else None)
                     video_url = (st.session_state.get("email_video_url") or "").strip()
                     queue = []
+                    loc = f"{st.session_state.get('city','')} {st.session_state.get('country','')}".strip()
+                    agency = st.session_state.get("agency", "")
                     for i in recipients:
                         row = email_leads.loc[i]
                         audit = st.session_state["audits"].get(lead_key(row), "")
                         q = {
                             "name": str(row["name"]),
                             "email": str(row["email"]),
-                            "subject": subject,
-                            "body": fill_template(body, row, st.session_state.get("agency", ""),
-                                                  f"{st.session_state.get('city','')} {st.session_state.get('country','')}".strip(),
-                                                  mode, audit, payment),
+                            "subject": fill_template(subject, row, agency, loc, mode),
+                            "body": fill_template(body, row, agency, loc, mode, audit, payment),
                         }
                         q["html"] = body_to_html(q["body"], image_cids=cids, cta=cta,
                                                   video=video_url)  # HTML « Luxe » + enrichi
@@ -2245,9 +3478,10 @@ def render_outreach_tab() -> None:
                             ck = st.session_state.get("composio_key", "")
                             send_fn = lambda item: send_via_composio(ck, item["email"], item["subject"], item["body"])  # noqa: E731
                         else:
-                            gu = st.session_state["gmail_user"]
-                            gp = st.session_state["gmail_pass"]
-                            send_fn = lambda item: send_via_smtp(gu, gp, item["email"], item["subject"], item["body"], html_body=item.get("html"), images=item.get("images"))  # noqa: E731
+                            send_fn = _account_send_fn(agency)  # roulement multi-comptes
+                        queue, quota_note = _outreach_queue_cap(queue)
+                        if quota_note:
+                            st.warning(quota_note)
                         state = {"queue": queue, "log": [], "pos": 0, "done": False,
                                  "stopped": False,
                                  "stats": {"contacted": 0, "wa": 0, "mail": 0, "fail": 0,
@@ -2259,6 +3493,7 @@ def render_outreach_tab() -> None:
                                              daemon=True)
                         st.session_state["out_thread"] = t
                         t.start()
+                        state["campaign_id"] = _campaign_append("Email", len(queue))["id"]
                         st.toast("Campagne démarrée ✓")
 
             if b2.button("⏹️ Stopper la campagne", use_container_width=True, disabled=not running):
@@ -2279,6 +3514,8 @@ def render_outreach_tab() -> None:
                     else:
                         st.success(f"Campagne terminée — {state['pos']}/{total} emails envoyés.")
                         st.session_state["sent_count"] += state["pos"]
+                    _campaign_update(state.get("campaign_id"), state["pos"],
+                                     "Interrompue" if state.get("stopped") else "Terminée")
                     _merge_stats(state["stats"])
                     st.session_state["out_state"] = None
                 else:
@@ -2300,11 +3537,20 @@ def render_outreach_tab() -> None:
 
         st.text_area("Message WhatsApp (placeholders)", key="wa_msg", height=150,
                      placeholder="Ex : Bonjour {LeadName} 👋 …")
+        _spam_wa = spam_risk_warning("", st.session_state.get("wa_msg", ""))
+        if _spam_wa:
+            st.warning(f"⚠️ Mots à risque dans le message WhatsApp : **{', '.join(_spam_wa)}**.")
         c1, c2 = st.columns([1, 3])
         c1.button("🔄 Modèle par défaut", use_container_width=True, on_click=_reset_wa_msg)
         c2.button("✍️ Améliorer le message avec OpenAI", use_container_width=True,
                   disabled=not (bool(st.session_state.get("openai_key")) and _OPENAI_AVAILABLE),
                   on_click=_improve_wa_openai)
+        c2.button("✨ Générer le message avec Gemini (ton du pays + faille)",
+                  use_container_width=True, key="gen_wa_btn",
+                  on_click=_gen_wa_gemini_cb,
+                  disabled=not bool(st.session_state.get("gemini_key")),
+                  help="Gemini rédige le message WhatsApp adapté au pays cible et à la faille "
+                       "détectée — placeholders {…} conservés.")
         _flush_outcome()
 
         wa_tpl = st.session_state.get("wa_msg") or DEFAULT_WA[mode]
@@ -2382,10 +3628,10 @@ def render_outreach_tab() -> None:
                             if not st.session_state.get("composio_key"):
                                 st.error("Renseignez la clé Composio (sidebar) pour le canal email.")
                                 creds_ok = False
-                        elif not (st.session_state.get("gmail_user")
-                                  and st.session_state.get("gmail_pass")):
-                            st.error("Renseignez les credentials Gmail (sidebar) pour les envois "
-                                     "email — ou choisissez le canal Composio.")
+                        elif not parse_gmail_accounts():
+                            st.error("Renseignez au moins un compte Gmail (sidebar : adresse + mot "
+                                     "de passe d'application, ou comptes additionnels) — ou "
+                                     "choisissez le canal Composio.")
                             creds_ok = False
                     if creds_ok:
                         agency = st.session_state.get("agency", "")
@@ -2396,7 +3642,8 @@ def render_outreach_tab() -> None:
                         body_oc = st.session_state.get("email_body") \
                             or DEFAULT_TEMPLATES[mode]["body"]
                         payment = (payment_block(mode, st.session_state.get("iban", ""),
-                                                 st.session_state.get("africa_payment", ""))
+                                                 st.session_state.get("africa_payment", ""),
+                                                 st.session_state.get("country", ""))
                                    if payment_on else "")
                         img_list_oc = st.session_state.get("email_images_data") or []
                         cids_oc = [f"img_{i}" for i in range(len(img_list_oc))]
@@ -2432,9 +3679,10 @@ def render_outreach_tab() -> None:
                                 ck = st.session_state.get("composio_key", "")
                                 email_fn = lambda it: send_via_composio(ck, it["email"], it["subject"], it["body"])  # noqa: E731
                             else:
-                                gu = st.session_state["gmail_user"]
-                                gp = st.session_state["gmail_pass"]
-                                email_fn = lambda it: send_via_smtp(gu, gp, it["email"], it["subject"], it["body"], html_body=it.get("html"), images=it.get("images"))  # noqa: E731
+                                email_fn = _account_send_fn(agency)  # roulement multi-comptes
+                            queue, quota_note = _outreach_queue_cap(queue)
+                            if quota_note:
+                                st.warning(quota_note)
                             state = {"queue": queue, "log": [], "pos": 0, "done": False,
                                      "stopped": False,
                                      "stats": {"contacted": 0, "wa": 0, "mail": 0, "fail": 0,
@@ -2447,6 +3695,8 @@ def render_outreach_tab() -> None:
                                                  daemon=True)
                             st.session_state["hybrid_thread"] = t
                             t.start()
+                            state["campaign_id"] = _campaign_append(
+                                "Hybride (WhatsApp + Email)", len(queue))["id"]
                             st.toast("One-Click Multi-Send démarré ✓")
                 if b2.button("⏹️ Stopper", use_container_width=True, disabled=not running,
                              key="hybrid_stop_btn"):
@@ -2464,6 +3714,8 @@ def render_outreach_tab() -> None:
                             st.warning("One-Click interrompu par l'utilisateur.")
                         else:
                             st.success(f"Terminé — {hstate['pos']}/{total} leads traitées.")
+                        _campaign_update(hstate.get("campaign_id"), hstate["pos"],
+                                         "Interrompue" if hstate.get("stopped") else "Terminée")
                         _merge_stats(hstate["stats"])
                         st.session_state["hybrid_state"] = None
                     else:
@@ -2489,6 +3741,8 @@ def render_dashboard_tab() -> None:
     st.markdown("### 📊 Dashboard de campagne")
     leads = st.session_state["leads"]
     stats = st.session_state["campaign_stats"]
+    country = st.session_state.get("country", "") or "—"
+    responses = st.session_state.setdefault("responses", {})
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Leads", len(leads))
@@ -2499,6 +3753,57 @@ def render_dashboard_tab() -> None:
     succ = stats["mail"] + stats["wa"]
     c6.metric("Taux de succès",
               f"{100 * succ / (succ + stats['fail']):.0f} %" if (succ + stats["fail"]) else "—")
+
+    answered = sum(1 for v in responses.values() if v and not str(v).startswith("❌"))
+    clicks = int(st.session_state.get("tracked_clicks", 0) or 0)
+    r1, r2, r3, r4 = st.columns(4)
+    r1.metric("Taux de réponse",
+              f"{100 * answered / stats['contacted']:.0f} %" if stats["contacted"] else "—")
+    r2.metric("Taux de clic (liens trackés)",
+              f"{100 * clicks / stats['mail']:.0f} %" if stats["mail"] else "—")
+    r3.metric("Réponses positives", answered)
+    r4.number_input("🖱️ Clics trackés (manuel)", 0, 100000, key="tracked_clicks")
+
+    st.markdown("#### 🗂️ Campagnes en cours")
+    st.caption("Reporting v6 — colonnes [Nom | Pays | Source | Statut Envoi | Réponse détectée]. "
+               "Le statut de réponse est marqué MANUELLEMENT dans la colonne dédiée.")
+    if leads.empty:
+        st.info("Aucune lead — lancez une recherche dans l'onglet Discovery.")
+    else:
+        rows = []
+        for _, r in leads.iterrows():
+            rows.append({
+                "Nom": str(r.get("name", "")),
+                "Pays": country,
+                "Source (Maps/LinkedIn…)": str(r.get("source", "") or "—"),
+                "Statut Envoi": str(r.get("status", "") or "—"),
+                "Réponse détectée (manuel)": responses.get(lead_key(r), ""),
+            })
+        camp_df = pd.DataFrame(rows)
+        edited = st.data_editor(
+            camp_df, key="resp_editor", hide_index=True, use_container_width=True, height=300,
+            disabled=["Nom", "Pays", "Source (Maps/LinkedIn…)", "Statut Envoi"],
+            column_config={
+                "Réponse détectée (manuel)": st.column_config.SelectboxColumn(
+                    "Réponse détectée (manuel)", options=RESPONSE_OPTS, width="medium"),
+            },
+        )
+        for (_, lr), (_, er) in zip(leads.iterrows(), edited.iterrows()):
+            k = lead_key(lr)
+            v = er.get("Réponse détectée (manuel)", "")
+            if v:
+                responses[k] = v
+            elif k in responses:
+                responses.pop(k, None)
+
+    st.markdown("#### 🚀 Campagnes lancées")
+    camps = st.session_state.get("campaigns", [])
+    if camps:
+        st.dataframe(pd.DataFrame(camps), hide_index=True, use_container_width=True, height=180)
+        st.caption("Les campagnes lancées depuis l'onglet Outreach apparaissent ici avec leur "
+                   "progression et leur statut (En cours / Terminée / Interrompue).")
+    else:
+        st.caption("Aucune campagne lancée pour l'instant — lancez un envoi dans l'onglet Outreach.")
 
     st.markdown("#### Répartition par segment")
     if leads.empty:
@@ -2541,6 +3846,7 @@ def main() -> None:
     )
     inject_css()
     init_session()
+    _normalize_leads_index()
 
     mode = st.session_state["mode"]
     if st.session_state.get("prev_mode") != mode:
@@ -2554,7 +3860,7 @@ def main() -> None:
     st.markdown(
         f'<div class="brand">'
         f'<div class="brand-eyebrow">Scriba Omniscient · Prospection IA</div>'
-        f'<div class="brand-title">Prospector <small>V1.0</small></div>'
+        f'<div class="brand-title">Prospector <small>V6</small></div>'
         f'<div class="brand-sub"><b>{agency}</b> — {MODE_INFO[mode]["emoji"]} {mode} · '
         f'{st.session_state.get("city","") or "Ville"} / {st.session_state.get("country","") or "Pays"}</div>'
         f'</div>',
@@ -2574,9 +3880,13 @@ def main() -> None:
     with tab4:
         render_dashboard_tab()
 
+    # v6 : sauvegarde instantanée des champs modifiés (settings.json)
+    persist_settings()
+
     st.markdown(
-        '<div class="ftr">⛏️ SCRIBA OMNISCIENT PROSPECTOR · <b>v1.1</b> · '
-        'Segments A/B · IA FR/EN · One-Click Multi-Send · Dashboard</div>',
+        '<div class="ftr">⛏️ SCRIBA OMNISCIENT PROSPECTOR · <b>v6</b> · '
+        'settings.json · 10 pays francophones · LinkedIn Sniper · Audit IA sites · '
+        'Dashboard campagnes · IA par pays</div>',
         unsafe_allow_html=True,
     )
 
