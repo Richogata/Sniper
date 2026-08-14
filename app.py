@@ -2394,6 +2394,24 @@ def init_session() -> None:
             st.session_state["warmup_start"] = datetime.strptime(_ws, "%Y-%m-%d").date()
         except ValueError:
             st.session_state["warmup_start"] = datetime.now().date()
+    # --- Coercition de types : settings.json est un fichier en clair (valeurs
+    # souvent str, parfois vides/corrompues). Sans coercition, un widget reçoit
+    # "true" / "" au lieu de True / False et plante le rendu (crucial sur un
+    # déploiement multi-sessions comme Streamlit Cloud où settings.json est partagé).
+    for _k in ("lang_en", "warmup_enabled"):
+        _v = st.session_state.get(_k)
+        if _v is not None and not isinstance(_v, bool):
+            st.session_state[_k] = str(_v).strip().lower() in ("1", "true", "oui", "yes", "on")
+    _v = st.session_state.get("daily_limit")
+    if _v is not None and not isinstance(_v, int):
+        try:
+            # vide/corrompu -> 200 (défaut sain du widget) ; "0" explicite -> 0 (illimité)
+            st.session_state["daily_limit"] = int(_v) if str(_v).strip() else 200
+        except (TypeError, ValueError):
+            st.session_state["daily_limit"] = 200
+    st.session_state.setdefault("warmup_enabled", False)
+    st.session_state.setdefault("daily_limit", 200)
+    st.session_state.setdefault("warmup_start", datetime.now().date())
     if "_daily_sent" not in st.session_state:
         st.session_state["_daily_sent"] = {}
     if "fr_country" not in loaded:

@@ -736,4 +736,28 @@ _fb2 = app.gemini_generate("k", "gemini-3.5-flash", "p", max_retries=1, base_wai
 assert _fb2 == "réponse de secours" and len(_fb_calls) == 1
 out("[OK] gemini_generate : bascule automatique 429/404 -> modèle de secours")
 
+# 39) v7 — coercition de types des settings (settings.json en clair) :
+# "true"/"" -> bool, "" -> int, sinon crash des widgets ('str' object
+# cannot be interpreted as an integer) sur déploiement/session partagée
+app.st.session_state["warmup_enabled"] = ""          # corrompu : str vide
+app.st.session_state["lang_en"] = "true"             # str au lieu de bool
+app.st.session_state["daily_limit"] = ""             # str vide au lieu de int
+app.st.session_state["warmup_start"] = "2026-08-14"  # ISO str -> date
+app.init_session()
+assert app.st.session_state["warmup_enabled"] is False, app.st.session_state["warmup_enabled"]
+assert app.st.session_state["lang_en"] is True
+assert app.st.session_state["daily_limit"] == 200
+assert app.st.session_state["warmup_start"].__class__.__name__ == "date"
+# boot vierge (aucun fichier de settings) -> défauts sains, pas de crash
+_orig_sf = app.SETTINGS_FILE
+app.SETTINGS_FILE = app.Path("_no_such_settings_regression.json")  # type: ignore[assignment]
+app.st.session_state.pop("warmup_enabled", None)
+app.st.session_state.pop("daily_limit", None)
+app.st.session_state.pop("warmup_start", None)
+app.init_session()
+assert app.st.session_state["warmup_enabled"] is False
+assert app.st.session_state["daily_limit"] == 200
+app.SETTINGS_FILE = _orig_sf
+out("[OK] coercition de types settings (bool/int/date) + défauts boot vierge")
+
 out("TOUS LES TESTS UNITAIRES OK")

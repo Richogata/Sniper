@@ -116,9 +116,9 @@ assert not at.exception, [e.value for e in at.exception]
 assert "Bonjour" in at.session_state["email_body"] or "listing" in at.session_state["email_body"]
 _out("[OK] Clic « Réinitialiser le modèle » (on_click) sans exception")
 
-_# Restaure settings.json (la session de test ne doit pas altérer les vraies clés)
+# Restaure settings.json (la session de test ne doit pas altérer les vraies clés)
 if _BAK.exists():
     shutil.copy2(_BAK, _SETTINGS)
     _BAK.unlink(missing_ok=True)
 
-out("TOUS LES TESTS UI OK")
+_out("TOUS LES TESTS UI OK")
