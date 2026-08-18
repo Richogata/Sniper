@@ -85,7 +85,7 @@ out("[OK] audit_prompt segment + langue + AIDA/PAS")
 
 # 4ter) body_to_html : email HTML clair et lisible (fond blanc, texte sombre)
 html = app.body_to_html("Bonjour {LeadName},\n\nCeci est un test.")
-assert html.startswith("<div") and "background:#f4f4f2" in html and "Bonjour" in html
+assert html.startswith("<div") and "background:#f8f8f8" in html and "Bonjour" in html
 assert "#0d0d0f" not in html  # plus de fond sombre (illisible dans Gmail)
 assert "color:#222222" in html  # texte sombre sur fond clair
 out("[OK] body_to_html (email HTML clair, lisible, anti-spam friendly)")

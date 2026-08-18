@@ -1702,17 +1702,10 @@ def body_to_html(text: str, image_cids: list[str] | None = None,
     rich_html = "\n".join(rich)
 
     return (
-        "<div style=\"background:#f4f4f2;padding:32px 12px;font-family:Helvetica,Arial,sans-serif;\">"
-        "<div style=\"max-width:600px;margin:0 auto;background:#ffffff;border:1px solid #e0e0dc;"
-        "border-radius:10px;padding:36px;\">"
-        "<div style=\"color:#8a6d1f;font-size:12px;letter-spacing:2px;text-transform:uppercase;"
-        "margin-bottom:18px;border-bottom:1px solid #eaeae6;padding-bottom:14px;\">"
-        "Scriba Omniscient · Prospection</div>"
+        "<div style=\"background:#f8f8f8;padding:24px 12px;font-family:Helvetica,Arial,sans-serif;\">"
+        "<div style=\"max-width:600px;margin:0 auto;background:#ffffff;"
+        "border-radius:8px;padding:32px;\">"
         f"{rich_html}{body}"
-        "<div style=\"margin-top:24px;padding-top:14px;border-top:1px solid #eaeae6;"
-        "color:#888888;font-size:12px;font-family:Helvetica,Arial,sans-serif;\">"
-        "Message professionnel envoyé dans le cadre d'une prospection B2B. Si vous n'êtes pas le "
-        "bon interlocuteur, répondez « STOP » pour ne plus être recontacté.</div>"
         "</div></div>"
     )
 
@@ -1733,17 +1726,16 @@ def send_via_smtp(sender: str, password: str, to: str, subject: str, body: str,
 
     Structure MIME : multipart/mixed -> [multipart/alternative -> [texte, related ->
     [HTML + images inline]], pièces jointes].  Le conteneur racine est
-    multipart/mixed quand il y a des pièces jointes, sinon multipart/alternative.
-
-    Anti-spam : en-têtes propres (From avec nom d'affichage, Reply-To explicite,
-    List-Unsubscribe déclaré) + texte brut + HTML clair. Gmail signe SPF/DKIM
-    automatiquement pour les envois via smtp.gmail.com.
+    multipart/mixed quand il y a des pièces jointes, sinon multipart/alternative.    Anti-spam complet :
+      · From avec nom d'affichage (pas d'adresse brute)
+      · Reply-To explicite
+      · List-Unsubscribe + List-Unsubscribe-Post (One-Click)
+      · Precedence: bulk (indique aux filtres que c'est un envoi de masse légitime)
+      · Auto-Submitted: auto-generated
+      · X-Mailer pour transparence
+      · Texte brut + HTML clair (ratio texte/image élevé)
+      · Gmail signe SPF/DKIM automatiquement via smtp.gmail.com.
     """
-    from email.mime.base import MIMEBase
-    from email.mime.image import MIMEImage
-    from email.mime.multipart import MIMEMultipart
-    from email.mime.text import MIMEText
-
     from email.mime.base import MIMEBase
     from email.mime.image import MIMEImage
     from email.mime.multipart import MIMEMultipart
@@ -1752,14 +1744,22 @@ def send_via_smtp(sender: str, password: str, to: str, subject: str, body: str,
     display = (str(sender_name or "").strip() or sender)
     has_docs = bool(attachments)
 
+    def _apply_anti_spam_headers(msg):
+        """Applique les en-têtes anti-spam sur un message MIME."""
+        msg["From"] = f"{display} <{sender}>"
+        msg["To"] = to
+        msg["Reply-To"] = sender
+        msg["Subject"] = subject
+        msg["List-Unsubscribe"] = f"<mailto:{sender}?subject=unsubscribe>"
+        msg["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
+        msg["Precedence"] = "bulk"
+        msg["Auto-Submitted"] = "auto-generated"
+        msg["X-Mailer"] = "Scriba Prospector"
+        msg["X-Campaign"] = "prospection-b2b"
+
     # --- Construire la partie « alternative » : texte brut + HTML + images inline ---
     alt = MIMEMultipart("alternative")
-    alt["From"] = f"{display} <{sender}>"
-    alt["To"] = to
-    alt["Reply-To"] = sender
-    alt["Subject"] = subject
-    alt["List-Unsubscribe"] = f"<mailto:{sender}?subject=unsubscribe>"
-    alt["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
+    _apply_anti_spam_headers(alt)
     alt.attach(MIMEText(body or "", "plain", "utf-8"))
     if images:
         related = MIMEMultipart("related")
@@ -1777,12 +1777,7 @@ def send_via_smtp(sender: str, password: str, to: str, subject: str, body: str,
     # --- Si pièces jointes : conteneur racine = multipart/mixed ---
     if has_docs:
         Root = MIMEMultipart("mixed")
-        Root["From"] = f"{display} <{sender}>"
-        Root["To"] = to
-        Root["Reply-To"] = sender
-        Root["Subject"] = subject
-        Root["List-Unsubscribe"] = f"<mailto:{sender}?subject=unsubscribe>"
-        Root["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
+        _apply_anti_spam_headers(Root)
         Root.attach(alt)
         for doc in attachments:
             maintype = str(doc.get("maintype") or "application").lower()
