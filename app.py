@@ -1714,39 +1714,48 @@ def body_to_html(text: str, image_cids: list[str] | None = None,
 def send_via_smtp(sender: str, password: str, to: str, subject: str, body: str,
                   html_body: str | None = None,
                   images: list[dict] | None = None,
+                  attachments: list[dict] | None = None,
                   sender_name: str = "") -> str:
     """Envoie un email Gmail via smtplib (ENVOI RÉEL — pas de simulation).
 
     `images` = liste de dicts {maintype, subtype, data} attachées en inline
     (cid: img_0, img_1, …).
+    `attachments` = liste de dicts {filename, data, maintype, subtype} pour les
+    documents joints (PDF, Word, Excel, etc.).
     `sender_name` = nom d'affichage (ex. nom de l'agence) — Gmail l'affiche dans
     la boîte de réception, ce qui rassure le prospect et améliore le taux d'ouverture.
 
-    Structure MIME : multipart/alternative -> [texte brut, multipart/related ->
-    [HTML + images inline]].  (L'ancienne implémentation utilisait
-    `add_related` APRÈS `add_alternative`, ce qui levait
-    `ValueError: Cannot convert alternative to related` dès qu'une image était
-    jointe — le mail n'était jamais envoyé.)
+    Structure MIME : multipart/mixed -> [multipart/alternative -> [texte, related ->
+    [HTML + images inline]], pièces jointes].  Le conteneur racine est
+    multipart/mixed quand il y a des pièces jointes, sinon multipart/alternative.
 
     Anti-spam : en-têtes propres (From avec nom d'affichage, Reply-To explicite,
     List-Unsubscribe déclaré) + texte brut + HTML clair. Gmail signe SPF/DKIM
     automatiquement pour les envois via smtp.gmail.com.
     """
+    from email.mime.base import MIMEBase
+    from email.mime.image import MIMEImage
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+
+    from email.mime.base import MIMEBase
     from email.mime.image import MIMEImage
     from email.mime.multipart import MIMEMultipart
     from email.mime.text import MIMEText
 
     display = (str(sender_name or "").strip() or sender)
-    msg = MIMEMultipart("alternative")
-    msg["From"] = f"{display} <{sender}>"
-    msg["To"] = to
-    msg["Reply-To"] = sender
-    msg["Subject"] = subject
-    msg["List-Unsubscribe"] = f"<mailto:{sender}?subject=unsubscribe>"
-    msg["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
-    msg.attach(MIMEText(body or "", "plain", "utf-8"))
+    has_docs = bool(attachments)
+
+    # --- Construire la partie « alternative » : texte brut + HTML + images inline ---
+    alt = MIMEMultipart("alternative")
+    alt["From"] = f"{display} <{sender}>"
+    alt["To"] = to
+    alt["Reply-To"] = sender
+    alt["Subject"] = subject
+    alt["List-Unsubscribe"] = f"<mailto:{sender}?subject=unsubscribe>"
+    alt["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
+    alt.attach(MIMEText(body or "", "plain", "utf-8"))
     if images:
-        # partie « related » : HTML + images inline (cid: img_0, img_1, …)
         related = MIMEMultipart("related")
         related.attach(MIMEText(html_body or body_to_html(body or ""), "html", "utf-8"))
         for i, img in enumerate(images):
@@ -1755,13 +1764,40 @@ def send_via_smtp(sender: str, password: str, to: str, subject: str, body: str,
             part.add_header("Content-ID", f"<img_{i}>")
             part.add_header("Content-Disposition", "inline", filename=f"img_{i}.{subtype}")
             related.attach(part)
-        msg.attach(related)
+        alt.attach(related)
     elif html_body:
-        msg.attach(MIMEText(html_body, "html", "utf-8"))
+        alt.attach(MIMEText(html_body, "html", "utf-8"))
+
+    # --- Si pièces jointes : conteneur racine = multipart/mixed ---
+    if has_docs:
+        Root = MIMEMultipart("mixed")
+        Root["From"] = f"{display} <{sender}>"
+        Root["To"] = to
+        Root["Reply-To"] = sender
+        Root["Subject"] = subject
+        Root["List-Unsubscribe"] = f"<mailto:{sender}?subject=unsubscribe>"
+        Root["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
+        Root.attach(alt)
+        for doc in attachments:
+            maintype = str(doc.get("maintype") or "application").lower()
+            subtype = str(doc.get("subtype") or "octet-stream").lower()
+            filename = str(doc.get("filename") or "attachment").strip()
+            data = doc.get("data")
+            if not data:
+                continue
+            from email import encoders as _encoders
+            part = MIMEBase(maintype, subtype)
+            part.set_payload(data)
+            _encoders.encode_base64(part)
+            part.add_header("Content-Disposition", f'attachment; filename="{filename}"')
+            Root.attach(part)
+    else:
+        Root = alt  # pas de pièces jointes → racine = alternative (structure d'origine)
+
     ctx = ssl.create_default_context()
     with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx, timeout=30) as server:
         server.login(sender, password)
-        server.send_message(msg)
+        server.send_message(Root)
     return "ok"
 
 
@@ -1859,7 +1895,9 @@ def _account_send_fn(agency: str):
         idx[0] += 1
         res = send_via_smtp(sender, password, item["email"], item["subject"],
                             item["body"], html_body=item.get("html"),
-                            images=item.get("images"), sender_name=agency)
+                            images=item.get("images"),
+                            attachments=item.get("attachments"),
+                            sender_name=agency)
         with _DAILY_LOCK:
             _ds = st.session_state.setdefault("_daily_sent", {})
             key = str(datetime.now().date())
@@ -3402,12 +3440,22 @@ def _bulk_parse_emails_from_excel(file) -> pd.DataFrame:
 
 
 def render_bulk_email_tab() -> None:
-    """Onglet Envoi Masse : Excel -> email unique -> envoi à toutes les adresses."""
+    """Onglet Envoi Masse : Excel -> email visuel -> envoi à toutes les adresses.
+
+    Fonctionnalités :
+      · Upload Excel/CSV → détection auto colonne email + nom
+      · Éditeur email : objet + corps avec barre d'outils (Gras, Italique, Lien, Image)
+      · 🖼️ Images inline dans le corps (CID, affichées dans Gmail)
+      · 📎 Documents joints (PDF, Word, Excel, etc.)
+      · 🔗 Liens cliquables dans le message
+      · 👁️ Aperçu HTML en direct
+      · 📊 Suivi en direct + rapport final
+    """
     st.markdown("### 📬 Envoi Masse (Excel → Gmail)")
     st.caption(
-        "Uploadez un fichier Excel contenant des adresses email, rédigez un seul message, "
-        "et l'outil envoie l'email à chaque adresse une par une. Les erreurs sont ignorées "
-        "et l'envoi continue. **Limite Gmail : 500 emails / 24h par compte.**")
+        "Uploadez un fichier Excel contenant des adresses email, rédigez un message "
+        "avec des images, des liens et des pièces jointes, et l'outil envoie l'email "
+        "à chaque adresse une par une. Les erreurs sont ignorées. **500 emails / 24h par compte Gmail.**")
 
     # ── 1) Upload du fichier Excel ──
     with st.expander("📁 1. Importer le fichier Excel", expanded=True):
@@ -3426,7 +3474,8 @@ def render_bulk_email_tab() -> None:
                 st.session_state["bulk_recipients"] = df_emails
                 st.success(f"✅ {len(df_emails)} adresse(s) email détectée(s) dans « {uploaded.name} »")
                 with st.expander("👁️ Aperçu des adresses", expanded=False):
-                    st.dataframe(df_emails, use_container_width=True, height=min(300, 40 + 35 * len(df_emails)))
+                    st.dataframe(df_emails, use_container_width=True,
+                                 height=min(300, 40 + 35 * len(df_emails)))
         elif "bulk_recipients" in st.session_state:
             df_emails = st.session_state["bulk_recipients"]
             if not df_emails.empty:
@@ -3448,32 +3497,125 @@ def render_bulk_email_tab() -> None:
                 for acc_email, _ in accounts:
                     st.write(f"• {acc_email}")
 
-    # ── 3) Rédaction du message ──
-    with st.expander("✍️ 3. Rédiger le message", expanded=True):
+    # ── 3) Éditeur email ──
+    with st.expander("✍️ 3. Éditeur email", expanded=True):
+        # --- Objet ---
         bulk_subject = st.text_input(
-            "Objet de l'email", key="bulk_subject",
+            "📝 Objet de l'email", key="bulk_subject",
             placeholder="Ex : Opportunité de collaboration",
-            help="L'objet est identique pour tous les destinataires.")
+            help="L'objet est identique pour tous les destinataires. "
+                 "Utilisez {Name} pour insérer le nom du destinataire.")
+
+        # --- Barre d'outils ---
+        st.markdown("**📝 Corps du message** — Utilisez la barre d'outils ci-dessous :")
+        t1, t2, t3, t4, t5 = st.columns(5)
+        if t1.button("**Gras**", key="bulk_btn_bold", help="Insère des astérisques pour le gras"):
+            cur = st.session_state.get("bulk_body", "")
+            st.session_state["bulk_body"] = cur + "**texte en gras**"
+        if t2.button("_Italique_", key="bulk_btn_italic", help="Insère des underscores pour l'italique"):
+            cur = st.session_state.get("bulk_body", "")
+            st.session_state["bulk_body"] = cur + "_texte en italique_"
+        if t3.button("🔗 Lien", key="bulk_btn_link", help="Insère un lien cliquable"):
+            cur = st.session_state.get("bulk_body", "")
+            st.session_state["bulk_body"] = cur + "[ texte du lien](https://example.com)"
+        if t4.button("🖼️ Image", key="bulk_btn_image", help="Insère une image par URL"):
+            cur = st.session_state.get("bulk_body", "")
+            st.session_state["bulk_body"] = cur + "![légende](https://example.com/image.png)"
+        if t5.button("↩️ Saut de ligne", key="bulk_btn_br", help="Insère un saut de paragraphe"):
+            cur = st.session_state.get("bulk_body", "")
+            st.session_state["bulk_body"] = cur + "\n\n"
+
+        # --- Corps du message ---
         bulk_body = st.text_area(
-            "Corps du message", key="bulk_body", height=250,
-            placeholder="Bonjour,\n\nVotre message ici...",
-            help="Utilisez {Name} pour insérer le nom du destinataire (si détecté dans le fichier). "
-                 "Exemple : « Bonjour {Name}, … » → « Bonjour Jean Dupont, … »")
+            "Corps du message", key="bulk_body", height=300,
+            placeholder="Bonjour {Name},\n\n"
+                         "Votre message ici…\n\n"
+                         "Vous pouvez aussi insérer des liens : [texte](https://…), "
+                         "des images : ![alt](https://…/image.png).",
+            help="Placeholders : {Name} = nom du destinataire. "
+                 "Markdown supporté : **gras**, _italique_, [lien](url), ![image](url).")
+
+        # --- Images inline (CID dans le corps) ---
+        with st.expander("🖼️ Images dans le corps (inline CID)", expanded=False):
+            st.caption("Ces images sont intégrées directement dans l'email (pas en pièce jointe). "
+                       "Gmail et la plupart des clients les affichent en haut du message.")
+            bulk_inline_imgs = st.file_uploader(
+                "Images à insérer dans le corps",
+                type=["png", "jpg", "jpeg", "gif", "webp"],
+                accept_multiple_files=True, key="bulk_inline_imgs",
+                help="Les images sont envoyées en inline (CID) — affichées dans le corps de l'email.")
+            inline_img_data = []
+            for f in bulk_inline_imgs or []:
+                mime = (f.type or "image/png").split("/")
+                inline_img_data.append({
+                    "maintype": mime[0] or "image",
+                    "subtype": mime[1] if len(mime) > 1 else "png",
+                    "data": f.getvalue(),
+                })
+            st.session_state["bulk_inline_img_data"] = inline_img_data
+            if inline_img_data:
+                st.success(f"{len(inline_img_data)} image(s) inline prête(s) ✓")
+
+        # --- Pièces jointes (documents) ---
+        with st.expander("📎 Pièces jointes (PDF, Word, Excel, etc.)", expanded=False):
+            st.caption("Joignez des documents à l'email : PDF, Word, Excel, images, etc. "
+                       "Les fichiers sont envoyés en pièce jointe (pas dans le corps).")
+            bulk_attachments = st.file_uploader(
+                "Documents à joindre",
+                type=["pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
+                      "csv", "txt", "zip", "rar", "png", "jpg", "jpeg", "gif"],
+                accept_multiple_files=True, key="bulk_attachments",
+                help="Maximum 25 Mo au total (limite Gmail). Les fichiers sont joints en pièce jointe.")
+            attach_data = []
+            total_size = 0
+            for f in bulk_attachments or []:
+                data = f.getvalue()
+                total_size += len(data)
+                mime_type = f.type or "application/octet-stream"
+                parts = mime_type.split("/")
+                attach_data.append({
+                    "filename": f.name,
+                    "data": data,
+                    "maintype": parts[0] if parts else "application",
+                    "subtype": parts[1] if len(parts) > 1 else "octet-stream",
+                })
+            st.session_state["bulk_attach_data"] = attach_data
+            if attach_data:
+                size_mb = total_size / (1024 * 1024)
+                size_color = "🟢" if size_mb < 20 else "🟡" if size_mb < 25 else "🔴"
+                st.success(f"{len(attach_data)} fichier(s) joint(s) — {size_color} {size_mb:.1f} Mo")
+                for doc in attach_data:
+                    st.caption(f"  📄 {doc['filename']} ({doc['subtype']}, "
+                               f"{len(doc['data']) / 1024:.0f} Ko)")
+                if total_size > 25 * 1024 * 1024:
+                    st.error("⚠️ Total > 25 Mo — Gmail refuse les emails de plus de 25 Mo. "
+                             "Réduisez la taille ou le nombre de fichiers.")
+
+        # --- Avertissement spam ---
         _bulk_spam = spam_risk_warning(bulk_subject, bulk_body)
         if _bulk_spam:
             st.warning(f"⚠️ Mots à risque de spam détectés : **{', '.join(_bulk_spam)}**. "
                        "Remplacez-les pour éviter le dossier spam.")
-        st.caption("Placeholders disponibles : **{Name}** (nom du destinataire, si présent dans le fichier).")
-        if bulk_subject and bulk_body:
-            sample_name = "Jean Dupont"
-            preview = bulk_body.replace("{Name}", sample_name)
-            preview_subj = bulk_subject.replace("{Name}", sample_name)
-            with st.expander("👁️ Aperçu du message (exemple)", expanded=False):
-                st.markdown(f"**Objet :** {preview_subj}")
-                st.divider()
-                st.write(preview)
 
-    # --- Vérification état en cours (hors expander, pour tout le bloc) ---
+        st.caption("Placeholders : **{Name}** = nom du destinataire · "
+                   "Markdown : **gras**, _italique_, [lien](url), ![image](url)")
+
+    # --- Aperçu HTML en direct ---
+    if bulk_subject or bulk_body:
+        with st.expander("👁️ Aperçu de l'email (rendu HTML)", expanded=False):
+            sample_name = "Jean Dupont"
+            preview_subj = (bulk_subject or "").replace("{Name}", sample_name)
+            preview_body = (bulk_body or "").replace("{Name}", sample_name)
+            cids = [f"img_{i}" for i in range(len(st.session_state.get("bulk_inline_img_data") or []))]
+            preview_html = body_to_html(preview_body, image_cids=cids)
+            st.markdown(f"**Objet :** {preview_subj}")
+            st.divider()
+            st.components.v1.html(preview_html, height=400, scrolling=True)
+            if st.session_state.get("bulk_attach_data"):
+                st.caption("📎 " + " · ".join(
+                    d["filename"] for d in st.session_state["bulk_attach_data"]))
+
+    # --- Vérification état en cours ---
     running_bulk = bool(st.session_state.get("bulk_thread")
                         and st.session_state["bulk_thread"].is_alive())
 
@@ -3491,6 +3633,21 @@ def render_bulk_email_tab() -> None:
             n = len(df_bulk)
             will_send = min(n, remaining)
             skipped = n - will_send
+            # Résumé de la configuration
+            n_imgs = len(st.session_state.get("bulk_inline_img_data") or [])
+            n_docs = len(st.session_state.get("bulk_attach_data") or [])
+            parts = [
+                f"📊 **{n}** destinataire(s)",
+                f"**{will_send}** seront envoyés",
+            ]
+            if skipped:
+                parts.append(f"**{skipped}** en attente (quota)")
+            if n_imgs:
+                parts.append(f"🖼️ {n_imgs} image(s) inline")
+            if n_docs:
+                parts.append(f"📎 {n_docs} document(s) joint(s)")
+            st.markdown(" · ".join(parts))
+
             c1, c2 = st.columns([3, 1])
             dmin, dmax = c1.slider(
                 "Délai entre envois (secondes)", 5, 300, (15, 15), step=5,
@@ -3500,28 +3657,29 @@ def render_bulk_email_tab() -> None:
                                     help="Délai réduit pour tester rapidement.")
             if test_bulk:
                 dmin, dmax = 2, 4
-            st.markdown(
-                f"📊 **Résumé** : {n} destinataire(s) · "
-                f"**{will_send}** seront envoyés · "
-                + (f"**{skipped}** en attente (quota atteint)" if skipped else "quota suffisant")
-                + f" · Délai : {dmin}-{dmax} s")
+
             b1, b2 = st.columns([3, 1])
             if b1.button("▶️ Lancer l'envoi en masse", type="primary",
                          use_container_width=True, disabled=running_bulk):
                 agency = st.session_state.get("agency", "")
+                img_list = st.session_state.get("bulk_inline_img_data") or []
+                cids = [f"img_{i}" for i in range(len(img_list))]
+                doc_list = st.session_state.get("bulk_attach_data") or []
                 queue = []
                 for _, row in df_bulk.iterrows():
                     email_addr = str(row["email"]).strip()
                     name_val = str(row.get("name", "")).strip()
                     subj = bulk_subject.replace("{Name}", name_val or "")
                     body_text = bulk_body.replace("{Name}", name_val or "")
-                    html = body_to_html(body_text)
+                    html = body_to_html(body_text, image_cids=cids)
                     queue.append({
                         "email": email_addr,
                         "name": name_val or email_addr.split("@")[0].title(),
                         "subject": subj,
                         "body": body_text,
                         "html": html,
+                        "images": img_list if img_list else None,
+                        "attachments": doc_list if doc_list else None,
                     })
                 # Appliquer le quota restant
                 quota = daily_send_limit() or 999_999
@@ -3579,7 +3737,8 @@ def render_bulk_email_tab() -> None:
                 with st.expander(f"❌ Détail des {failed} échec(s)", expanded=True):
                     err_df = pd.DataFrame(state["stats"]["errors"])
                     err_df.columns = ["Email", "Nom", "Raison de l'échec"]
-                    st.dataframe(err_df, use_container_width=True, height=min(400, 40 + 35 * len(err_df)))
+                    st.dataframe(err_df, use_container_width=True,
+                                 height=min(400, 40 + 35 * len(err_df)))
             if state.get("stopped"):
                 st.warning("⏹️ Envoi interrompu par l'utilisateur ou quota Gmail atteint. "
                            f"{total_in_file - pos} email(s) restant(s).")
@@ -3598,9 +3757,8 @@ def render_bulk_email_tab() -> None:
         rerun()
 
     st.info(
-        "**Rappel** : Gmail limite l'envoi à **500 emails / 24h** par compte. "
-        "Pour envoyer plus, ajoutez des comptes additionnels dans la barre latérale "
-        "(« Comptes additionnels » — un email:motdepasse par ligne). "
+        "**Rappel** : Gmail limite l'envoi à **500 emails / 24h** par compte (25 Mo par email). "
+        "Pour envoyer plus, ajoutez des comptes additionnels dans la barre latérale « Comptes additionnels ». "
         "Les envois sont répartis automatiquement entre les comptes (round-robin).")
 
 
