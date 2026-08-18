@@ -901,4 +901,118 @@ assert _state3["stopped"] is True
 assert _state3["pos"] == 2  # arrêt après 2 envois
 out("[OK] bulk_mass_worker : arrêt manuel (stop_event)")
 
+# 44) _generate_tracking_id : ID unique par destinataire
+id1 = app._generate_tracking_id("test@example.com", 12345)
+id2 = app._generate_tracking_id("test@example.com", 12345)
+id3 = app._generate_tracking_id("other@example.com", 12345)
+assert isinstance(id1, str) and len(id1) == 12
+assert id1 != id2  # même email, même campagne → IDs différents (uuid)
+assert id1 != id3  # emails différents → IDs différents
+out("[OK] _generate_tracking_id : ID unique par destinataire")
+
+# 45) _generate_tracking_pixel_html : pixel vide si pas de base_url, sinon HTML
+assert app._generate_tracking_pixel_html("abc123", "") == ""
+pixel = app._generate_tracking_pixel_html("abc123", "https://example.com")
+assert 'img src=' in pixel
+assert 'abc123' in pixel
+assert 'track=open' in pixel
+out("[OK] _generate_tracking_pixel_html : vide si pas de base_url, pixel sinon")
+
+# 46) _wrap_link_for_tracking : lien wrappé avec base_url
+wrapped = app._wrap_link_for_tracking("https://target.com", "abc123", "https://track.com")
+assert "track.com" in wrapped
+assert "abc123" in wrapped
+assert "target.com" in wrapped
+assert wrapped == app._wrap_link_for_tracking("https://target.com", "abc123", "https://track.com")
+out("[OK] _wrap_link_for_tracking : lien wrappé correctement")
+
+# 47) _wrap_link_for_tracking : pas de wrapping sans base_url
+assert app._wrap_link_for_tracking("https://target.com", "abc123", "") == "https://target.com"
+out("[OK] _wrap_link_for_tracking : pas de wrapping sans base_url")
+
+# 48) _campaign_create : tracking_id ajouté à chaque destinataire
+camp = app._campaign_create(
+    subject="Test", body="Body", html="<p>Body</p>",
+    recipients=[{"email": "a@test.com", "name": "A"},
+                {"email": "b@test.com", "name": "B"}],
+    scheduled_at="")
+assert camp["total"] == 2
+for r in camp["recipients"]:
+    assert "tracking_id" in r
+    assert r["status"] == app.TRACK_PENDING
+    assert r["sent_at"] == ""
+    assert r["error"] == ""
+    assert isinstance(r["clicked_links"], list)
+# Nettoyage : retirer la campagne test
+camps = app._load_campaigns()
+camps = [c for c in camps if c.get("id") != camp["id"]]
+app._save_campaigns(camps)
+out("[OK] _campaign_create : tracking_id + statut par destinataire")
+
+# 49) _campaign_create : statut scheduled si date future
+camp2 = app._campaign_create(
+    subject="Test2", body="Body2", html="<p>Body2</p>",
+    recipients=[{"email": "c@test.com", "name": "C"}],
+    scheduled_at="2099-01-01T12:00:00")
+assert camp2["recipients"][0]["status"] == app.TRACK_SCHEDULED
+assert camp2["state"] == app.CAMP_PLANNED
+# Nettoyage
+camps = app._load_campaigns()
+camps = [c for c in camps if c.get("id") != camp2["id"]]
+app._save_campaigns(camps)
+out("[OK] _campaign_create : scheduled → TRACK_SCHEDULED + CAMP_PLANNED")
+
+# 50) _update_recipient_status_raw : mise à jour dans le fichier
+camp3 = app._campaign_create(
+    subject="Test3", body="Body3", html="<p>Body3</p>",
+    recipients=[{"email": "d@test.com", "name": "D"},
+                {"email": "e@test.com", "name": "E"}],
+    scheduled_at="")
+app._update_recipient_status_raw(camp3["id"], "d@test.com", app.TRACK_SENT)
+camps = app._load_campaigns()
+for c in camps:
+    if c.get("id") == camp3["id"]:
+        for r in c["recipients"]:
+            if r["email"] == "d@test.com":
+                assert r["status"] == app.TRACK_SENT
+                assert r["sent_at"] != ""
+            elif r["email"] == "e@test.com":
+                assert r["status"] == app.TRACK_PENDING
+        assert c["sent"] == 1
+        assert c["failed"] == 0
+        break
+# Nettoyage
+camps = [c for c in camps if c.get("id") != camp3["id"]]
+app._save_campaigns(camps)
+out("[OK] _update_recipient_status_raw : statut mis à jour")
+
+# 51) _update_recipient_status_raw : détection bounce
+app._update_recipient_status_raw(camp3["id"], "e@test.com", app.TRACK_BOUNCED, error="550 mailbox not found")
+camps = app._load_campaigns()
+for c in camps:
+    if c.get("id") == camp3["id"]:
+        for r in c["recipients"]:
+            if r["email"] == "e@test.com":
+                assert r["status"] == app.TRACK_BOUNCED
+                assert r["error"] == "550 mailbox not found"
+        assert c["bounced"] == 1
+        break
+# Nettoyage final
+camps = [c for c in camps if c.get("id") != camp3["id"]]
+app._save_campaigns(camps)
+out("[OK] _update_recipient_status_raw : bounce détecté")
+
+# 52) _enrich_html_with_tracking : pixel + liens wrappés
+html_orig = '<p><a href="https://example.com">Lien</a></p></div>'
+html_tracked = app._enrich_html_with_tracking(html_orig, "abc123", "https://track.com")
+assert 'track.com' in html_tracked
+assert 'abc123' in html_tracked
+assert 'pixel' not in html_tracked.lower() or 'img_' in html_tracked
+out("[OK] _enrich_html_with_tracking : pixel + liens wrappés")
+
+# 53) _enrich_html_with_tracking : rien si pas de base_url
+html_same = app._enrich_html_with_tracking(html_orig, "abc123", "")
+assert html_same == html_orig
+out("[OK] _enrich_html_with_tracking : pas de modification sans base_url")
+
 out("TOUS LES TESTS UNITAIRES OK")

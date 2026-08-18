@@ -34,7 +34,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import inspect
+import imaplib
 import json
 import os
 import random
@@ -43,12 +45,15 @@ import smtplib
 import ssl
 import threading
 import time
+import uuid
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from email.header import decode_header
 from email.message import EmailMessage
+from email.utils import parseaddr
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 import pandas as pd
 import requests
@@ -2424,6 +2429,7 @@ def init_session() -> None:
     st.session_state.setdefault("campaigns", [])
     st.session_state.setdefault("responses", {})
     st.session_state.setdefault("tracked_clicks", 0)
+    st.session_state.setdefault("tracking_base_url", "")
     st.session_state.setdefault("ln_niche", "")
     st.session_state.setdefault("ln_city", "")
     st.session_state.setdefault("lang_en", False)
@@ -3339,6 +3345,25 @@ CAMP_DONE = "Terminée"
 CAMP_CANCELLED = "Annulée"
 CAMP_PAUSED = "En attente (quota)"
 
+# --- Statuts de suivi par destinataire ---
+TRACK_PENDING = "⏳ En attente"
+TRACK_SCHEDULED = "📅 Programmé"
+TRACK_SENT = "📨 Envoyé"
+TRACK_OPENED = "👁️ Ouvert"
+TRACK_CLICKED = "🔗 Cliqué"
+TRACK_REPLIED = "💬 Répondu"
+TRACK_FAILED = "❌ Échec"
+TRACK_BOUNCED = "📭 Bounce"
+
+TRACK_ICONS = {
+    TRACK_PENDING: "⏳", TRACK_SCHEDULED: "📅", TRACK_SENT: "📨",
+    TRACK_OPENED: "👁️", TRACK_CLICKED: "🔗", TRACK_REPLIED: "💬",
+    TRACK_FAILED: "❌", TRACK_BOUNCED: "📭",
+}
+
+# --- Tracking pixel / lien (configurable) ---
+TRACKING_BASE_URL = ""  # ex. "https://votre-app.com" — défini par l'utilisateur
+
 
 def _load_campaigns() -> list[dict]:
     """Charge les campagnes depuis campaigns.json (retourne [] si absent/corrompu)."""
@@ -3359,21 +3384,40 @@ def _save_campaigns(campaigns: list[dict]) -> None:
         pass
 
 
+def _generate_tracking_id(email: str, camp_id: int) -> str:
+    """Génère un ID de suivi unique pour un destinataire."""
+    raw = f"{email}:{camp_id}:{uuid.uuid4().hex[:8]}"
+    return hashlib.md5(raw.encode()).hexdigest()[:12]
+
+
 def _campaign_create(subject: str, body: str, html: str,
                      recipients: list[dict],
                      images: list[dict] | None = None,
                      attachments: list[dict] | None = None,
                      scheduled_at: str = "",
                      min_delay: int = 15, max_delay: int = 15) -> dict:
-    """Crée une nouvelle campagne et la sauvegarde."""
+    """Crée une nouvelle campagne avec suivi par destinataire."""
     campaigns = _load_campaigns()
+    camp_id = int(time.time() * 1000) % 10 ** 9
+    # Ajouter tracking_id + statut à chaque destinataire
+    enriched_recipients = []
+    for r in recipients:
+        er = dict(r)
+        er["tracking_id"] = _generate_tracking_id(er.get("email", ""), camp_id)
+        er["status"] = TRACK_SCHEDULED if scheduled_at else TRACK_PENDING
+        er["sent_at"] = ""
+        er["opened_at"] = ""
+        er["clicked_links"] = []
+        er["replied_at"] = ""
+        er["error"] = ""
+        enriched_recipients.append(er)
     camp = {
-        "id": int(time.time() * 1000) % 10 ** 9,
+        "id": camp_id,
         "subject": subject,
         "body": body,
         "html": html,
-        "recipients": recipients,
-        "total": len(recipients),
+        "recipients": enriched_recipients,
+        "total": len(enriched_recipients),
         "images": images or [],
         "attachments": attachments or [],
         "scheduled_at": scheduled_at,  # ISO format ou "" pour immédiat
@@ -3382,10 +3426,15 @@ def _campaign_create(subject: str, body: str, html: str,
         "state": CAMP_PLANNED if scheduled_at else CAMP_RUNNING,
         "sent": 0,
         "failed": 0,
-        "pending": len(recipients),
+        "bounced": 0,
+        "opened": 0,
+        "clicked": 0,
+        "replied": 0,
+        "pending": len(enriched_recipients),
         "pos": 0,
         "log": [],
         "errors": [],
+        "tracking_enabled": True,
         "created_at": datetime.now().isoformat(),
         "started_at": "",
         "finished_at": "",
@@ -3417,10 +3466,218 @@ def _campaign_cancel(camp_id: int) -> bool:
     return False
 
 
+# ------------------------------------------------------------------
+#  Suivi : détection de réponses (IMAP) + pixel de tracking + liens trackés
+# ------------------------------------------------------------------
+
+def _generate_tracking_pixel_html(tracking_id: str, base_url: str) -> str:
+    """Génère un pixel de suivi HTML (1x1 transparent) — à insérer dans le corps email.
+    Le pixel pointe vers base_url ?track=open&id=tracking_id."""
+    if not base_url:
+        return ""
+    pixel_url = f"{base_url.rstrip('/')}/?track=open&id={tracking_id}"
+    return (f'<img src="{pixel_url}" width="1" height="1" '
+            'style="display:none;opacity:0;" alt="" />')
+
+
+def _wrap_link_for_tracking(url: str, tracking_id: str, base_url: str) -> str:
+    """Wrap un lien pour le suivi de clic. Si base_url est configuré, redirige
+    via base_url ?track=click&id=...&url=... Sinon, retourne l'URL d'origine."""
+    if not base_url or not url:
+        return url
+    params = urlencode({"track": "click", "id": tracking_id, "url": url})
+    return f"{base_url.rstrip('/')}/?{params}"
+
+
+def _enrich_html_with_tracking(html: str, tracking_id: str, base_url: str) -> str:
+    """Ajoute le pixel de suivi et wrap les liens dans le HTML d'un email."""
+    if not base_url or not tracking_id:
+        return html
+    # 1) Ajouter le pixel de suivi d'ouverture (avant la fermeture </div> finale)
+    pixel = _generate_tracking_pixel_html(tracking_id, base_url)
+    if pixel:
+        # Insérer avant le dernier </div>
+        idx = html.rfind("</div>")
+        if idx > 0:
+            html = html[:idx] + pixel + html[idx:]
+    # 2) Wrapper les liens <a href="...">
+    def _replace_link(m):
+        original = m.group(1)
+        if original.startswith("cid:") or original.startswith("mailto:"):
+            return m.group(0)
+        wrapped = _wrap_link_for_tracking(original, tracking_id, base_url)
+        return f'href="{wrapped}"'
+    html = re.sub(r'href="(https?://[^"]+)"', _replace_link, html)
+    return html
+
+
+def _check_replies_imap(gmail_user: str, gmail_pass: str,
+                        sent_subjects: list[str],
+                        sent_addresses: list[str],
+                        since_date: str = "") -> dict:
+    """Vérifie via IMAP les réponses reçues aux emails envoyés.
+    Retourne un dict {email_address: replied_at} pour les destinataires
+    qui ont répondu.
+    
+    `sent_subjects` = liste des objets envoyés (pour filtrer les In-Reply-To)
+    `sent_addresses` = liste des adresses destinataires
+    `since_date` = date de début au format DD-Mon-YYYY (ex. "18-Aug-2026")
+    """
+    replies = {}
+    if not gmail_user or not gmail_pass:
+        return replies
+    try:
+        ctx = ssl.create_default_context()
+        with imaplib.IMAP4_SSL("imap.gmail.com", 993, ssl_context=ctx) as mail:
+            mail.login(gmail_user, gmail_pass)
+            mail.select("INBOX")
+            # Chercher les emails reçus depuis la date donnée
+            criteria = "ALL"
+            if since_date:
+                criteria = f'(SINCE "{since_date}")'
+            status, data = mail.search(None, criteria)
+            if status != "OK":
+                return replies
+            msg_ids = data[0].split()
+            # Limiter à 200 emails récents pour la performance
+            for msg_id in msg_ids[-200:]:
+                status, msg_data = mail.fetch(msg_id, "(RFC822.HEADER)")
+                if status != "OK":
+                    continue
+                raw_header = msg_data[0][1]
+                if isinstance(raw_header, bytes):
+                    raw_header = raw_header.decode("utf-8", errors="replace")
+                # Extraire le From
+                from_match = re.search(r"From:\s*(.+)", raw_header, re.I)
+                if not from_match:
+                    continue
+                from_addr_raw = from_match.group(1).strip()
+                _, from_email = parseaddr(from_addr_raw)
+                from_email = from_email.lower().strip()
+                # Vérifier si c'est une réponse à l'un de nos emails
+                in_reply_to = re.search(r"In-Reply-To:\s*<([^>]+)>", raw_header, re.I)
+                references = re.search(r"References:\s*(.+)", raw_header, re.I)
+                subject_match = re.search(r"Subject:\s*(.+)", raw_header, re.I)
+                subject = ""
+                if subject_match:
+                    raw_subj = subject_match.group(1).strip()
+                    decoded = decode_header(raw_subj)
+                    parts = []
+                    for part, enc in decoded:
+                        if isinstance(part, bytes):
+                            parts.append(part.decode(enc or "utf-8", errors="replace"))
+                        else:
+                            parts.append(str(part))
+                    subject = "".join(parts)
+                # Est-ce une réponse ? (In-Reply-To ou References ou sujet Re:/Rép :)
+                is_reply = bool(in_reply_to or references)
+                is_re = bool(re.match(r"^(Re|Rép|RE|RÉP)\s*:", subject, re.I))
+                if not is_reply and not is_re:
+                    continue
+                # Le From doit être dans notre liste de destinataires
+                if from_email in [a.lower().strip() for a in sent_addresses]:
+                    # Date du reply
+                    date_match = re.search(r"Date:\s*(.+)", raw_header, re.I)
+                    reply_date = date_match.group(1).strip()[:25] if date_match else datetime.now().isoformat()
+                    replies[from_email] = reply_date
+    except Exception:  # noqa: BLE001
+        pass  # Erreur IMAP silencieuse — pas bloquant
+    return replies
+
+
+def _update_recipient_status(camp: dict, email_addr: str, new_status: str, **extra) -> None:
+    """Met à jour le statut d'un destinataire dans la campagne."""
+    email_lower = email_addr.lower().strip()
+    for r in camp.get("recipients", []):
+        if r.get("email", "").lower().strip() == email_lower:
+            r["status"] = new_status
+            now_iso = datetime.now().isoformat()
+            if new_status == TRACK_SENT:
+                r["sent_at"] = now_iso
+            elif new_status == TRACK_OPENED:
+                r["opened_at"] = now_iso
+            elif new_status == TRACK_CLICKED:
+                r["clicked_links"].append(now_iso)
+            elif new_status == TRACK_REPLIED:
+                r["replied_at"] = now_iso
+            elif new_status in (TRACK_FAILED, TRACK_BOUNCED):
+                r["error"] = extra.get("error", "")
+            for k, v in extra.items():
+                if k not in ("error",) and k in r:
+                    r[k] = v
+            break
+    # Mettre à jour les compteurs globaux
+    recipients = camp.get("recipients", [])
+    camp["sent"] = sum(1 for r in recipients if r.get("status") == TRACK_SENT)
+    camp["failed"] = sum(1 for r in recipients if r.get("status") == TRACK_FAILED)
+    camp["bounced"] = sum(1 for r in recipients if r.get("status") == TRACK_BOUNCED)
+    camp["opened"] = sum(1 for r in recipients if r.get("status") in (TRACK_OPENED, TRACK_CLICKED, TRACK_REPLIED))
+    camp["clicked"] = sum(1 for r in recipients if r.get("status") in (TRACK_CLICKED, TRACK_REPLIED))
+    camp["replied"] = sum(1 for r in recipients if r.get("status") == TRACK_REPLIED)
+    camp["pending"] = sum(1 for r in recipients if r.get("status") in (TRACK_PENDING, TRACK_SCHEDULED))
+    # Sauvegarder
+    campaigns = _load_campaigns()
+    for c in campaigns:
+        if c.get("id") == camp.get("id"):
+            c.update(camp)
+            break
+    _save_campaigns(campaigns)
+
+
+def _check_campaign_replies(camp: dict) -> int:
+    """Vérifie les réponses pour une campagne via IMAP. Retourne le nombre de nouvelles réponses."""
+    accounts = parse_gmail_accounts()
+    if not accounts:
+        return 0
+    # Utiliser le premier compte pour vérifier les réponses
+    gmail_user, gmail_pass = accounts[0]
+    # Adresses envoyées
+    sent_addresses = [r.get("email", "") for r in camp.get("recipients", [])
+                      if r.get("status") in (TRACK_SENT, TRACK_OPENED, TRACK_CLICKED)]
+    if not sent_addresses:
+        return 0
+    # Date de début : création ou démarrage de la campagne
+    since = camp.get("started_at") or camp.get("created_at") or ""
+    since_date = ""
+    if since:
+        try:
+            dt = datetime.fromisoformat(since)
+            since_date = dt.strftime("%d-%b-%Y")  # format IMAP
+        except ValueError:
+            pass
+    replies = _check_replies_imap(gmail_user, gmail_pass, [], sent_addresses, since_date)
+    # Mettre à jour les statuts
+    new_count = 0
+    for email_addr, reply_date in replies.items():
+        for r in camp.get("recipients", []):
+            if r.get("email", "").lower().strip() == email_addr.lower().strip():
+                if r.get("status") not in (TRACK_REPLIED,):
+                    r["status"] = TRACK_REPLIED
+                    r["replied_at"] = reply_date
+                    new_count += 1
+    if new_count > 0:
+        # Recalculer les compteurs
+        recipients = camp.get("recipients", [])
+        camp["replied"] = sum(1 for r in recipients if r.get("status") == TRACK_REPLIED)
+        campaigns = _load_campaigns()
+        for c in campaigns:
+            if c.get("id") == camp.get("id"):
+                c["replied"] = camp["replied"]
+                # Mettre à jour les recipients dans le fichier
+                for fr in c.get("recipients", []):
+                    for rr in recipients:
+                        if fr.get("email", "").lower() == rr.get("email", "").lower():
+                            fr["status"] = rr["status"]
+                            fr["replied_at"] = rr.get("replied_at", "")
+                            break
+                break
+        _save_campaigns(campaigns)
+    return new_count
+
+
 def execute_scheduled_campaign(camp: dict) -> None:
     """Exécute une campagne (appelé par le monitor thread).
-    Gère le quota Gmail : si la limite est atteinte, met en pause et
-diffère les destinataires restants."""
+    Gère le quota Gmail, suivi par destinataire, vérification des réponses."""
     camp_id = camp["id"]
     _campaign_update_field(camp_id, state=CAMP_RUNNING,
                            started_at=datetime.now().isoformat())
@@ -3434,6 +3691,7 @@ diffère les destinataires restants."""
     agency = st.session_state.get("agency", "") if hasattr(st, "session_state") else ""
     send_fn = _account_send_fn(agency)
     stop_event = threading.Event()
+    tracking_url = st.session_state.get("tracking_base_url", "") if hasattr(st, "session_state") else ""
 
     queue = camp["recipients"][camp.get("pos", 0):]  # reprendre d'où on en était
     total = camp["total"]
@@ -3460,11 +3718,24 @@ diffère les destinataires restants."""
                     pending=remaining_count)
                 return
 
-        log.append(f"→ [{sent + failed + 1}/{total}] {item.get('name', '')} <{item['email']}>")
+        email_addr = item.get("email", "")
+        log.append(f"→ [{sent + failed + 1}/{total}] {item.get('name', '')} <{email_addr}>")
+        # Enrichir le HTML avec tracking si configuré
+        send_item = dict(item)
+        tracking_id = item.get("tracking_id", "")
+        if tracking_url and tracking_id and send_item.get("html"):
+            send_item["html"] = _enrich_html_with_tracking(
+                send_item["html"], tracking_id, tracking_url)
         try:
-            send_fn(item)
+            send_fn(send_item)
             log.append("   ✅ envoyé")
             sent += 1
+            # Mettre à jour le statut du destinataire
+            for r in camp.get("recipients", []):
+                if r.get("email", "").lower().strip() == email_addr.lower().strip():
+                    r["status"] = TRACK_SENT
+                    r["sent_at"] = datetime.now().isoformat()
+                    break
         except Exception as exc:  # noqa: BLE001
             err_msg = str(exc)[:200]
             log.append(f"   ❌ échec : {err_msg}")
@@ -3472,8 +3743,19 @@ diffère les destinataires restants."""
                                                      for l in log):
                 log.append("   " + SMTP_HINT)
             failed += 1
-            errors.append({"email": item.get("email", ""),
+            errors.append({"email": email_addr,
                            "name": item.get("name", ""), "reason": err_msg})
+            # Détecter bounce (adresse invalide)
+            is_bounce = any(kw in err_msg.lower() for kw in
+                           ["bounced", "undeliverable", "invalid address",
+                            "mailbox not found", "does not exist",
+                            "recipient rejected", "over quota"])
+            new_status = TRACK_BOUNCED if is_bounce else TRACK_FAILED
+            for r in camp.get("recipients", []):
+                if r.get("email", "").lower().strip() == email_addr.lower().strip():
+                    r["status"] = new_status
+                    r["error"] = err_msg
+                    break
         # Sauvegarde périodique (tous les 5 envois)
         if (sent + failed) % 5 == 0:
             _campaign_update_field(
@@ -3490,6 +3772,11 @@ diffère les destinataires restants."""
                 time.sleep(1)
 
     final_state = CAMP_DONE if not stop_event.is_set() else CAMP_CANCELLED
+    # Vérifier les réponses avant de finaliser
+    try:
+        _check_campaign_replies(camp)
+    except Exception:  # noqa: BLE001
+        pass
     _campaign_update_field(
         camp_id, state=final_state, sent=sent, failed=failed,
         pos=camp.get("pos", 0) + len(queue), log=log, errors=errors,
@@ -3497,7 +3784,8 @@ diffère les destinataires restants."""
 
 
 def _campaign_monitor_thread() -> None:
-    """Thread daemon qui vérifie les campagnes programmées toutes les 30 secondes."""
+    """Thread daemon : vérifie les campagnes programmées + vérifie les réponses toutes les 60s."""
+    reply_counter = 0
     while True:
         time.sleep(30)
         try:
@@ -3524,6 +3812,14 @@ def _campaign_monitor_thread() -> None:
                                 execute_scheduled_campaign(camp)
                     except ValueError:
                         pass
+                elif state == CAMP_DONE:
+                    # Vérifier les réponses même après fin (toutes les 60s)
+                    reply_counter += 1
+                    if reply_counter % 2 == 0:  # ~60 secondes
+                        try:
+                            _check_campaign_replies(camp)
+                        except Exception:  # noqa: BLE001
+                            pass
         except Exception:  # noqa: BLE001
             pass
 
@@ -3539,10 +3835,11 @@ if not _monitor_started:
 def bulk_mass_worker(state: dict, stop_event: threading.Event, send_fn,
                      min_delay: int, max_delay: int) -> None:
     """Worker d'envoi en masse (immédiat, pas programmé).
-    Gère le quota Gmail 500/24 h : arrêt automatique quand la limite est atteinte.
-    Chaque échec est ignoré et l'envoi continue."""
+    Gère le quota Gmail 500/24 h, suivi par destinataire, vérification réponses."""
     total = len(state["queue"])
     quota = int(state.get("quota", 500))
+    tracking_url = state.get("tracking_url", "")
+    camp_id = state.get("camp_id")
     for i, item in enumerate(state["queue"]):
         if stop_event.is_set():
             break
@@ -3555,12 +3852,22 @@ def bulk_mass_worker(state: dict, stop_event: threading.Event, send_fn,
                     "Relancez demain pour continuer.")
                 state["stopped"] = True
                 break
-        state["log"].append(f"→ [{i + 1}/{total}] {item.get('name', '')} <{item['email']}>"
+        email_addr = item.get("email", "")
+        state["log"].append(f"→ [{i + 1}/{total}] {item.get('name', '')} <{email_addr}>"
                              + (f" · 💳 Compte : {item.get('sender', '')}" if item.get('sender') else ""))
+        # Enrichir le HTML avec tracking si configuré
+        send_item = dict(item)
+        tracking_id = item.get("tracking_id", "")
+        if tracking_url and tracking_id and send_item.get("html"):
+            send_item["html"] = _enrich_html_with_tracking(
+                send_item["html"], tracking_id, tracking_url)
         try:
-            send_fn(item)
+            send_fn(send_item)
             state["log"].append("   ✅ envoyé")
             state["stats"]["sent"] += 1
+            # Mettre à jour le statut du destinataire dans la campagne
+            if camp_id:
+                _update_recipient_status_raw(camp_id, email_addr, TRACK_SENT)
         except Exception as exc:  # noqa: BLE001
             err_msg = str(exc)[:200]
             state["log"].append(f"   ❌ échec : {err_msg}")
@@ -3569,10 +3876,19 @@ def bulk_mass_worker(state: dict, stop_event: threading.Event, send_fn,
                 state["log"].append("   " + SMTP_HINT)
             state["stats"]["failed"] += 1
             state["stats"]["errors"].append({
-                "email": item.get("email", ""),
+                "email": email_addr,
                 "name": item.get("name", ""),
                 "reason": err_msg,
             })
+            # Détecter bounce
+            is_bounce = any(kw in err_msg.lower() for kw in
+                           ["bounced", "undeliverable", "invalid address",
+                            "mailbox not found", "does not exist",
+                            "recipient rejected", "over quota"])
+            new_status = TRACK_BOUNCED if is_bounce else TRACK_FAILED
+            if camp_id:
+                _update_recipient_status_raw(camp_id, email_addr, new_status,
+                                             error=err_msg)
         state["pos"] = i + 1
         # --- Délai humain entre envois ---
         if i < total - 1 and not stop_event.is_set():
@@ -3583,6 +3899,47 @@ def bulk_mass_worker(state: dict, stop_event: threading.Event, send_fn,
                 time.sleep(1)
     state["stopped"] = stop_event.is_set() and state["pos"] < total
     state["done"] = True
+    # Vérifier les réponses à la fin
+    if camp_id:
+        try:
+            campaigns = _load_campaigns()
+            for c in campaigns:
+                if c.get("id") == camp_id:
+                    _check_campaign_replies(c)
+                    break
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _update_recipient_status_raw(camp_id: int, email_addr: str,
+                                 new_status: str, **extra) -> None:
+    """Met à jour le statut d'un destinataire dans le fichier campaigns.json."""
+    campaigns = _load_campaigns()
+    for c in campaigns:
+        if c.get("id") == camp_id:
+            for r in c.get("recipients", []):
+                if r.get("email", "").lower().strip() == email_addr.lower().strip():
+                    r["status"] = new_status
+                    now_iso = datetime.now().isoformat()
+                    if new_status == TRACK_SENT:
+                        r["sent_at"] = now_iso
+                    elif new_status in (TRACK_FAILED, TRACK_BOUNCED):
+                        r["error"] = extra.get("error", "")
+                    for k, v in extra.items():
+                        if k not in ("error",) and k in r:
+                            r[k] = v
+                    break
+            # Recalculer les compteurs
+            recipients = c.get("recipients", [])
+            c["sent"] = sum(1 for r in recipients if r.get("status") == TRACK_SENT)
+            c["failed"] = sum(1 for r in recipients if r.get("status") == TRACK_FAILED)
+            c["bounced"] = sum(1 for r in recipients if r.get("status") == TRACK_BOUNCED)
+            c["opened"] = sum(1 for r in recipients if r.get("status") in (TRACK_OPENED, TRACK_CLICKED, TRACK_REPLIED))
+            c["clicked"] = sum(1 for r in recipients if r.get("status") in (TRACK_CLICKED, TRACK_REPLIED))
+            c["replied"] = sum(1 for r in recipients if r.get("status") == TRACK_REPLIED)
+            c["pending"] = sum(1 for r in recipients if r.get("status") in (TRACK_PENDING, TRACK_SCHEDULED))
+            break
+    _save_campaigns(campaigns)
 
 
 def _bulk_parse_emails_from_excel(file) -> pd.DataFrame:
@@ -3662,24 +4019,52 @@ def render_bulk_email_tab() -> None:
       · 📅 Programmation date/heure précise
       · ⏸️ Pause auto si quota atteint, reprise automatique le lendemain
       · ❌ Erreurs ignorées, envoi continue
-      · 📊 Dashboard campagnes : Programmée → En cours → Terminée
+      · 📊 Tableau de suivi par destinataire (envoyé, ouvert, cliqué, répondu, échec, bounce)
+      · 📊 Dashboard complet : résumé + détail par destinataire + filtrage
+      · 🔍 Détection de réponses via IMAP Gmail
+      · 🖼️ Suivi d'ouverture (pixel) + suivi de clic (liens trackés)
     """
     st.markdown("### 📬 Envoi Masse (Excel → Gmail)")
     st.caption(
         "Créez et programmez des campagnes d'envoi email. Upload Excel, rédigez votre "
-        "message avec images/liens/documents, choisissez la date d'envoi. **500 emails / 24h par compte Gmail.**")
+        "message avec images/liens/documents, choisissez la date d'envoi. "
+        "**500 emails / 24h par compte Gmail.** Suivi par destinataire activé.")
 
-    # ═══════════════════════════════════════════════════════════════
-    #  SECTION 1 : Dashboard des campagnes
-    # ═══════════════════════════════════════════════════════════════
     _camp_states_icons = {
         CAMP_PLANNED: "📅", CAMP_RUNNING: "🔄", CAMP_DONE: "✅",
         CAMP_CANCELLED: "🚫", CAMP_PAUSED: "⏸️",
     }
+
+    # ═══════════════════════════════════════════════════════════════
+    #  SECTION 1 : Dashboard de suivi des campagnes
+    # ═══════════════════════════════════════════════════════════════
     campaigns = _load_campaigns()
     active_camps = [c for c in campaigns if c.get("state") in
                     (CAMP_PLANNED, CAMP_RUNNING, CAMP_PAUSED)]
+
     if campaigns:
+        # ── Tableau récapitulatif global ──
+        st.markdown("#### 📊 Tableau de suivi")
+        total_sent = sum(c.get("sent", 0) for c in campaigns)
+        total_failed = sum(c.get("failed", 0) for c in campaigns)
+        total_bounced = sum(c.get("bounced", 0) for c in campaigns)
+        total_opened = sum(c.get("opened", 0) for c in campaigns)
+        total_clicked = sum(c.get("clicked", 0) for c in campaigns)
+        total_replied = sum(c.get("replied", 0) for c in campaigns)
+        total_recipients = sum(c.get("total", 0) for c in campaigns)
+        total_pending = sum(c.get("pending", 0) for c in campaigns)
+
+        rc1, rc2, rc3, rc4, rc5, rc6, rc7, rc8 = st.columns(8)
+        rc1.metric("📊 Total", total_recipients)
+        rc2.metric("📨 Envoyés", total_sent)
+        rc3.metric("👁️ Ouverts", total_opened)
+        rc4.metric("🔗 Cliqués", total_clicked)
+        rc5.metric("💬 Réponses", total_replied)
+        rc6.metric("❌ Échecs", total_failed)
+        rc7.metric("📭 Bounces", total_bounced)
+        rc8.metric("⏳ En attente", total_pending)
+
+        # ── Liste des campagnes avec suivi détaillé ──
         with st.expander(f"📋 Campagnes ({len(campaigns)} total, {len(active_camps)} actives)",
                          expanded=bool(active_camps)):
             for camp in reversed(campaigns):
@@ -3688,17 +4073,19 @@ def render_bulk_email_tab() -> None:
                 icon = _camp_states_icons.get(state, "❓")
                 sched = camp.get("scheduled_at", "")
                 sched_str = "Immédiat" if not sched else sched.replace("T", " ")[:16]
+                n_total = camp.get("total", 0)
                 pct = 0
-                if camp.get("total", 0) > 0:
-                    pct = int(100 * (camp.get("sent", 0) + camp.get("failed", 0)) / camp["total"])
-                # Ligne de statut
+                if n_total > 0:
+                    pct = int(100 * (camp.get("sent", 0) + camp.get("failed", 0) + camp.get("bounced", 0)) / n_total)
+
+                # En-tête de la campagne
                 col_a, col_b, col_c = st.columns([5, 3, 2])
                 col_a.markdown(
                     f"**{icon} Campagne #{st_id}** — {state}\n"
-                    f"📅 {sched_str} · 📧 {camp.get('total', 0)} destinataires")
+                    f"📅 {sched_str} · 📧 {n_total} destinataires")
                 col_b.markdown(
-                    f"✅ {camp.get('sent', 0)} envoyés · ❌ {camp.get('failed', 0)} échoués · "
-                    f"⏳ {camp.get('pending', 0)} restants")
+                    f"📨 {camp.get('sent', 0)} envoyés · ❌ {camp.get('failed', 0)} échoués · "
+                    f"📭 {camp.get('bounced', 0)} bounces · ⏳ {camp.get('pending', 0)} restants")
                 if state in (CAMP_PLANNED, CAMP_PAUSED):
                     col_c.warning(f"{pct}%")
                     if col_c.button("🛑 Annuler", key=f"cancel_camp_{st_id}"):
@@ -3709,6 +4096,59 @@ def render_bulk_email_tab() -> None:
                     col_c.success(f"{pct}%")
                 else:
                     col_c.info(f"{pct}%")
+
+                # Métriques de suivi de cette campagne
+                st.caption(
+                    f"👁️ {camp.get('opened', 0)} ouverts · 🔗 {camp.get('clicked', 0)} cliqués · "
+                    f"💬 {camp.get('replied', 0)} réponses")
+
+                # Vérifier les réponses (bouton)
+                if state in (CAMP_DONE, CAMP_RUNNING) and camp.get("sent", 0) > 0:
+                    if st.button(f"🔍 Vérifier les réponses", key=f"check_replies_{st_id}"):
+                        with st.spinner("Vérification des réponses via IMAP…"):
+                            n_new = _check_campaign_replies(camp)
+                            if n_new > 0:
+                                st.toast(f"💬 {n_new} nouvelle(s) réponse(s) détectée(s) !", icon="💬")
+                            else:
+                                st.info("Aucune nouvelle réponse détectée.")
+                            rerun()
+
+                # ── Tableau détaillé par destinataire ──
+                recipients = camp.get("recipients", [])
+                if recipients:
+                    with st.expander(f"📊 Détail destinataires #{st_id} ({len(recipients)})", expanded=False):
+                        # Filtres
+                        filter_opts = ["Tous", TRACK_SENT, TRACK_OPENED, TRACK_CLICKED,
+                                       TRACK_REPLIED, TRACK_FAILED, TRACK_BOUNCED,
+                                       TRACK_PENDING, TRACK_SCHEDULED]
+                        sel_filter = st.selectbox(
+                            "Filtrer par statut", filter_opts, key=f"filter_{st_id}")
+                        if sel_filter == "Tous":
+                            filtered = recipients
+                        else:
+                            filtered = [r for r in recipients if r.get("status") == sel_filter]
+                        if filtered:
+                            rows = []
+                            for r in filtered:
+                                status = r.get("status", TRACK_PENDING)
+                                rows.append({
+                                    "📧 Email": r.get("email", ""),
+                                    "👤 Nom": r.get("name", ""),
+                                    "Statut": status,
+                                    "🕐 Envoyé": (r.get("sent_at", "") or "—")[:16],
+                                    "👁️ Ouvert": "✅" if r.get("opened_at") else "—",
+                                    "🔗 Cliqué": f"{len(r.get('clicked_links', []))}x" if r.get("clicked_links") else "—",
+                                    "💬 Répondu": "✅" if r.get("replied_at") else "—",
+                                    "❌ Erreur": (r.get("error", "") or "—")[:60],
+                                })
+                            detail_df = pd.DataFrame(rows)
+                            st.dataframe(detail_df, use_container_width=True,
+                                         height=min(400, 40 + 30 * len(rows)))
+                            # Résumé des filtres
+                            st.caption(f"Affichage : {len(filtered)}/{len(recipients)} destinataires")
+                        else:
+                            st.info("Aucun destinataire avec ce statut.")
+
                 # Journal détaillé
                 if camp.get("log"):
                     with st.expander(f"📜 Journal #{st_id}", expanded=False):
@@ -3759,8 +4199,24 @@ def render_bulk_email_tab() -> None:
             st.success(f"✅ {len(accounts)} compte(s) Gmail prêt(s) — "
                        f"**{remaining}** envoi(s) restant(s) aujourd'hui (limite : {limit_str}/jour).")
 
-    # ── 2c) Éditeur email ──
-    with st.expander("✍️ 3. Éditeur email", expanded=True):
+    # ── 2c) Configuration du suivi ──
+    with st.expander("🔍 3. Suivi & Tracking", expanded=False):
+        tracking_url = st.text_input(
+            "🔗 URL de base pour le tracking (optionnel)",
+            value=st.session_state.get("tracking_base_url", ""),
+            key="tracking_url_input",
+            placeholder="https://votre-app.com",
+            help="Si configuré : pixel de suivi d'ouverture + liens trackés pour le clic. "
+                 "Laissez vide pour désactiver le tracking externe."
+        )
+        st.session_state["tracking_base_url"] = tracking_url
+        if tracking_url:
+            st.success("✅ Tracking activé — pixel d'ouverture + liens trackés seront insérés.")
+        else:
+            st.info("Tracking externe désactivé. La détection de réponses via IMAP reste active.")
+
+    # ── 2d) Éditeur email ──
+    with st.expander("✍️ 4. Éditeur email", expanded=True):
         bulk_subject = st.text_input(
             "📝 Objet de l'email", key="bulk_subject",
             placeholder="Ex : Opportunité de collaboration",
@@ -3825,7 +4281,7 @@ def render_bulk_email_tab() -> None:
             st.warning(f"⚠️ Mots à risque spam : **{', '.join(_bulk_spam)}**")
         st.caption("Placeholders : **{Name}** · Markdown : **gras**, _italique_, [lien](url), ![image](url)")
 
-    # ── 2d) Aperçu HTML ──
+    # ── 2e) Aperçu HTML ──
     if bulk_subject or bulk_body:
         with st.expander("👁️ Aperçu de l'email (rendu HTML)", expanded=False):
             sample_name = "Jean Dupont"
@@ -3842,7 +4298,7 @@ def render_bulk_email_tab() -> None:
     # ═══════════════════════════════════════════════════════════════
     #  SECTION 3 : Programmation et lancement
     # ═══════════════════════════════════════════════════════════════
-    with st.expander("📅 4. Programmation & Lancement", expanded=True):
+    with st.expander("📅 5. Programmation & Lancement", expanded=True):
         df_bulk = st.session_state.get("bulk_recipients")
         if df_bulk is None or df_bulk.empty:
             st.info("⚠️ Importez d'abord un fichier Excel.")
@@ -3929,7 +4385,7 @@ def render_bulk_email_tab() -> None:
                     st.toast(f"📅 Campagne #{camp['id']} programmée ✓", icon="📅")
                 else:
                     st.toast(f"▶️ Campagne #{camp['id']} lancée ✓", icon="🚀")
-                    rerun()  # rafraîchir pour afficher le statut
+                    rerun()
 
     # ═══════════════════════════════════════════════════════════════
     #  SECTION 4 : Suivi en direct des campagnes actives
@@ -3937,6 +4393,7 @@ def render_bulk_email_tab() -> None:
     campaigns = _load_campaigns()
     running_camps = [c for c in campaigns if c.get("state") in (CAMP_RUNNING, CAMP_PAUSED)]
     if running_camps:
+        st.markdown("#### 🔄 Suivi en direct")
         for camp in running_camps:
             st_id = camp.get("id", 0)
             total = camp.get("total", 0)
@@ -3945,9 +4402,15 @@ def render_bulk_email_tab() -> None:
             failed = camp.get("failed", 0)
             state = camp.get("state", "")
             state_icon = _camp_states_icons.get(state, "❓")
-            st.markdown(f"#### {state_icon} Campagne #{st_id} — {state}")
+            st.markdown(f"**{state_icon} Campagne #{st_id}** — {state}")
             if total > 0:
                 st.progress(pos / total, text=f"Progression : {pos}/{total} — ✅ {sent} · ❌ {failed}")
+            # Métriques temps réel
+            d1, d2, d3, d4 = st.columns(4)
+            d1.metric("📨 Envoyés", sent)
+            d2.metric("❌ Échecs", failed)
+            d3.metric("👁️ Ouverts", camp.get("opened", 0))
+            d4.metric("💬 Réponses", camp.get("replied", 0))
             if camp.get("log"):
                 with st.expander(f"📜 Journal en direct #{st_id}", expanded=False):
                     st.code("\n".join(camp["log"][-60:]), language=None)
@@ -3955,12 +4418,12 @@ def render_bulk_email_tab() -> None:
                 st.info("⏸️ En attente — le quota Gmail sera réinitialisé demain. "
                         "La campagne reprendra automatiquement.")
         time.sleep(10)
-        rerun()  # auto-refresh pour le suivi en direct
+        rerun()
 
     st.info(
         "**Rappel** : Gmail limite l'envoi à **500 emails / 24h** par compte (25 Mo par email). "
-        "Si la limite est atteinte, les destinataires restants sont mis en attente et la campagne "
-        "reprend automatiquement le lendemain. Annulez une campagne programmée avant son lancement.")
+        "Le suivi inclut : 📨 envoyés · 👁️ ouverts (pixel) · 🔗 liens cliqués · 💬 réponses (IMAP) · "
+        "❌ échecs · 📭 bounces. La détection de réponses se fait via IMAP Gmail automatiquement.")
 
 
 # ------------------------------------------------------------------
