@@ -4,6 +4,7 @@ filtres de leads, lien WhatsApp, OpenAI (mocké), retry Gemini (mocké)."""
 from __future__ import annotations
 
 import importlib.util
+import smtplib
 import sys
 
 import pandas as pd
@@ -759,5 +760,145 @@ assert app.st.session_state["warmup_enabled"] is False
 assert app.st.session_state["daily_limit"] == 200
 app.SETTINGS_FILE = _orig_sf
 out("[OK] coercition de types settings (bool/int/date) + défauts boot vierge")
+
+# 40) _bulk_parse_emails_from_excel : détection colonne email + noms + doublons
+import io as _io
+import pandas as _pd_bulk
+
+# Cas 1 : colonne "Email" explicite + colonne "Nom"
+df1 = _pd_bulk.DataFrame({"Nom": ["Alice", "Bob", "Charlie"], "Email": ["alice@test.com", "bob@test.com", "charlie@test.com"]})
+buf1 = _io.BytesIO()
+df1.to_excel(buf1, index=False)
+buf1.seek(0)
+buf1.name = "test.xlsx"
+result1 = app._bulk_parse_emails_from_excel(buf1)
+assert len(result1) == 3, f"Expected 3, got {len(result1)}"
+assert result1.iloc[0]["email"] == "alice@test.com"
+assert result1.iloc[0]["name"] == "Alice"
+out("[OK] _bulk_parse_emails_from_excel : colonne Email + Nom")
+
+# Cas 2 : email trouvé automatiquement dans la 1ère colonne
+df2 = _pd_bulk.DataFrame({"col1": ["alice@test.com", "bob@test.com"]})
+buf2 = _io.BytesIO()
+df2.to_excel(buf2, index=False)
+buf2.seek(0)
+buf2.name = "test.xlsx"
+result2 = app._bulk_parse_emails_from_excel(buf2)
+assert len(result2) == 2
+assert result2.iloc[0]["email"] == "alice@test.com"
+out("[OK] _bulk_parse_emails_from_excel : détection auto colonne email")
+
+# Cas 3 : doublons → dédupliqués
+df3 = _pd_bulk.DataFrame({"mail": ["dup@test.com", "dup@test.com", "unique@test.com"]})
+buf3 = _io.BytesIO()
+df3.to_excel(buf3, index=False)
+buf3.seek(0)
+buf3.name = "test.xlsx"
+result3 = app._bulk_parse_emails_from_excel(buf3)
+assert len(result3) == 2, f"Expected 2 deduplicated, got {len(result3)}"
+out("[OK] _bulk_parse_emails_from_excel : doublons dédupliqués")
+
+# Cas 4 : CSV
+df4 = _pd_bulk.DataFrame({"Email": ["csv1@test.com", "csv2@test.com"]})
+buf4 = _io.BytesIO()
+df4.to_csv(buf4, index=False)
+buf4.seek(0)
+buf4.name = "test.csv"
+result4 = app._bulk_parse_emails_from_excel(buf4)
+assert len(result4) == 2
+out("[OK] _bulk_parse_emails_from_excel : CSV")
+
+# Cas 5 : email dans une cellule avec du texte
+df5 = _pd_bulk.DataFrame({"info": ["Contact: hello@world.com", "N/A", "test@email.org"]})
+buf5 = _io.BytesIO()
+df5.to_excel(buf5, index=False)
+buf5.seek(0)
+buf5.name = "test.xlsx"
+result5 = app._bulk_parse_emails_from_excel(buf5)
+assert len(result5) == 2, f"Expected 2, got {len(result5)}"
+assert result5.iloc[0]["email"] == "hello@world.com"
+out("[OK] _bulk_parse_emails_from_excel : email extrait de cellule texte")
+
+# 41) bulk_mass_worker : envoi avec erreur ignorée + quota
+import threading as _thr
+_stats = {"sent": 0, "failed": 0, "errors": []}
+_state = {
+    "queue": [
+        {"email": "a@test.com", "name": "A", "subject": "s1", "body": "b1"},
+        {"email": "bad@test.com", "name": "Bad", "subject": "s2", "body": "b2"},
+        {"email": "c@test.com", "name": "C", "subject": "s3", "body": "b3"},
+    ],
+    "total_in_file": 3,
+    "log": [],
+    "pos": 0,
+    "done": False,
+    "stopped": False,
+    "quota": 500,
+    "stats": _stats,
+}
+_call_count = [0]
+def _mock_send(item):
+    _call_count[0] += 1
+    if item["email"] == "bad@test.com":
+        raise smtplib.SMTPRecipientsRefused(550, b"Invalid")
+
+_stop = _thr.Event()
+app.bulk_mass_worker(_state, _stop, _mock_send, 0, 0)
+assert _state["done"] is True
+assert _state["stats"]["sent"] == 2  # a@test.com + c@test.com
+assert _state["stats"]["failed"] == 1  # bad@test.com
+assert len(_state["stats"]["errors"]) == 1
+assert _state["stats"]["errors"][0]["email"] == "bad@test.com"
+assert _call_count[0] == 3  # les 3 ont été tentés
+out("[OK] bulk_mass_worker : erreur ignorée, envoi continue")
+
+# 42) bulk_mass_worker : arrêt par quota
+app.st.session_state["_daily_sent"] = {}  # reset compteur quotidien
+daily_key = str(app.datetime.now().date())
+app.st.session_state["_daily_sent"][daily_key] = 0  # compteur propre
+_stats2 = {"sent": 0, "failed": 0, "errors": []}
+_state2 = {
+    "queue": [{"email": f"u{i}@t.com", "name": f"U{i}", "subject": "s", "body": "b"} for i in range(10)],
+    "total_in_file": 10,
+    "log": [],
+    "pos": 0,
+    "done": False,
+    "stopped": False,
+    "quota": 3,  # simulate quota at 3
+    "stats": _stats2,
+}
+def _mock_send_inc(item):
+    """Mock qui incrémente le compteur quotidien (comme _account_send_fn)."""
+    with app._DAILY_LOCK:
+        _ds = app.st.session_state.setdefault("_daily_sent", {})
+        _ds[daily_key] = int(_ds.get(daily_key, 0)) + 1
+app.bulk_mass_worker(_state2, _thr.Event(), _mock_send_inc, 0, 0)
+assert _state2["stats"]["sent"] == 3, f"sent={_state2['stats']['sent']}"
+assert _state2["pos"] == 3
+assert any("Quota" in l for l in _state2["log"])
+out("[OK] bulk_mass_worker : arrêt automatique au quota")
+
+# 43) bulk_mass_worker : arrêt manuel (stop_event)
+_stats3 = {"sent": 0, "failed": 0, "errors": []}
+_stop3 = _thr.Event()
+_state3 = {
+    "queue": [{"email": f"u{i}@t.com", "name": f"U{i}", "subject": "s", "body": "b"} for i in range(5)],
+    "total_in_file": 5,
+    "log": [],
+    "pos": 0,
+    "done": False,
+    "stopped": False,
+    "quota": 999,
+    "stats": _stats3,
+}
+_n = [0]
+def _mock_stop(item):
+    _n[0] += 1
+    if _n[0] == 2:
+        _stop3.set()
+app.bulk_mass_worker(_state3, _stop3, _mock_stop, 0, 0)
+assert _state3["stopped"] is True
+assert _state3["pos"] == 2  # arrêt après 2 envois
+out("[OK] bulk_mass_worker : arrêt manuel (stop_event)")
 
 out("TOUS LES TESTS UNITAIRES OK")

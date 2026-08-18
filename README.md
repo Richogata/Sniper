@@ -19,6 +19,7 @@ Tableau de bord Streamlit de prospection automatisée pour **4 modèles d'affair
 4. **Audit IA des sites (module AI Agency)** — scan HTML parallèle (BeautifulSoup, 8 workers) : absence de `chatbot` / `assistant` / `IA` / `AI` / `Intercom` / `Crisp` + présence d'un `<form>` ou du mot « Contact » → lead marquée **🎯 Cible Prioritaire IA**. Filtres dédiés + colonnes `ai_target` / `ai_audit`.
 5. **Dashboard de campagnes** — tableau [Nom | Pays | Source | Statut Envoi | Réponse détectée (manuel)] + campagnes lancées suivies en direct, **taux de réponse** et **taux de clic** (liens trackés).
 6. **Personnalisation IA par pays** — Gemini rédige 100 % de l'email / du message WhatsApp selon la niche, la faille détectée et le pays cible (ton formel en France, plus chaleureux au Togo…).
+7. **📬 Envoi Masse (Excel → Gmail)** — importez un fichier Excel avec des adresses email, rédigez un seul message, et l'outil envoie l'email à chaque adresse une par une. Les erreurs sont ignorées, le quota Gmail (500/24h) est respecté avec arrêt automatique, et un rapport détaillé (✅ envoyés / ❌ échoués / ⏳ restants) est affiché à la fin.
 
 ---
 
@@ -69,6 +70,15 @@ L'app s'ouvre sur `http://localhost:8501`.
   - *Web Design* : **3 arguments** sur les pertes liées à l'absence de site, focus **confiance diaspora**.
   - *SEO* : script de vente **QR code + avis 5 étoiles → chiffre d'affaires**.
 - Audits stockés, éditables, exportables en Markdown.
+
+### 📬 Onglet 3b — Envoi Masse (Excel → Gmail)
+- **Upload Excel/CSV** : importez un fichier contenant des adresses email — détection automatique de la colonne email + colonne nom optionnelle.
+- **Message unique** : rédigez un seul objet + corps ; placeholder `{Name}` pour personnaliser par destinataire.
+- **Envoi séquentiel** : emails envoyés un par un via Gmail (smtplib), avec délai humain anti-spam (réglable 5–300 s).
+- **Quota Gmail** : compteur intégré — **500 emails / 24h par compte Gmail** — arrêt automatique quand la limite est atteinte.
+- **Multi-comptes** : envois répartis entre tous les comptes Gmail configurés (round-robin) + réchauffement progressif.
+- **Erreurs ignorées** : chaque échec (adresse invalide, refus SMTP…) est journalisé et l'envoi continue au suivant.
+- **Rapport final** : ✅ envoyés, ❌ échoués, 📊 total traité, ⏳ restants + détail de chaque échec.
 
 ### 🚀 Onglet 3 — Smart Outreach
 - **✨ Génération IA par pays (Gemini Flash)** : un clic rédige 100 % de l'email (objet + corps) ou du message WhatsApp — adapté à la niche, à la faille détectée et au pays cible (formel en France, plus chaleureux au Togo…), placeholders `{…}` conservés.

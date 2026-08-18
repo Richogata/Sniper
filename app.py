@@ -21,6 +21,9 @@
       taux de clic et taux de réponse.
     · Personnalisation IA par pays (Gemini Flash) — formel en France,
       plus chaleureux au Togo, etc.
+    · 📬 Envoi Masse (Excel → Gmail) — upload Excel avec adresses email,
+      message unique, envoi séquentiel, quota 500/24h par compte Gmail,
+      erreurs ignorées, rapport final détaillé.
 
   Stack : Streamlit · Google GenAI (Gemini) · Pandas · Requests ·
           BeautifulSoup · ddgs (DuckDuckGo) · smtplib · Composio
@@ -2364,6 +2367,9 @@ def init_session() -> None:
     st.session_state.setdefault("out_state", None)
     st.session_state.setdefault("out_stop", threading.Event())
     st.session_state.setdefault("out_thread", None)
+    st.session_state.setdefault("bulk_state", None)
+    st.session_state.setdefault("bulk_stop", threading.Event())
+    st.session_state.setdefault("bulk_thread", None)
     st.session_state.setdefault("wa_msg", "")
     st.session_state.setdefault("my_wa", "")
     st.session_state.setdefault("sectors_sel", [s["label"] for s in SECTORS[MODE_COPY]])
@@ -3276,13 +3282,331 @@ def _mark_wa(i: int) -> None:
                str(row["name"]), "lien wa.me ouvert")
         st.session_state["_out_toast"] = "WhatsApp ouvert — contact compté ✓"
     except Exception as exc:  # noqa: BLE001
-        st.session_state["_out_error"] = f"Échec WhatsApp : {exc}"
+        st.session_state["_out_error"] = f"Échec WhatsApp : {exc}"# ------------------------------------------------------------------
+#  Tab 3b — Envoi Masse (Excel -> Gmail)
+# ------------------------------------------------------------------
+
+def bulk_mass_worker(state: dict, stop_event: threading.Event, send_fn,
+                     min_delay: int, max_delay: int) -> None:
+    """Worker d'envoi en masse depuis un fichier Excel.
+    Gère le quota Gmail 500/24 h : arrêt automatique quand la limite est atteinte.
+    Chaque échec est ignoré et l'envoi continue."""
+    total = len(state["queue"])
+    quota = int(state.get("quota", 500))
+    for i, item in enumerate(state["queue"]):
+        if stop_event.is_set():
+            break
+        # --- Vérification du quota par compte Gmail ---
+        with _DAILY_LOCK:
+            if daily_sent_count() >= quota:
+                state["log"].append(
+                    f"\n🛑 Quota Gmail atteint ({quota}/24h). "
+                    f"Arrêt automatique — {total - i} email(s) restant(s). "
+                    "Relancez demain pour continuer.")
+                state["stopped"] = True
+                break
+        state["log"].append(f"→ [{i + 1}/{total}] {item.get('name', '')} <{item['email']}>"
+                             + (f" · 💳 Compte : {item.get('sender', '')}" if item.get('sender') else ""))
+        try:
+            send_fn(item)
+            state["log"].append("   ✅ envoyé")
+            state["stats"]["sent"] += 1
+        except Exception as exc:  # noqa: BLE001
+            err_msg = str(exc)[:200]
+            state["log"].append(f"   ❌ échec : {err_msg}")
+            if _is_bad_credentials(exc) and not any("Identifiants Gmail refusés" in l
+                                                     for l in state["log"]):
+                state["log"].append("   " + SMTP_HINT)
+            state["stats"]["failed"] += 1
+            state["stats"]["errors"].append({
+                "email": item.get("email", ""),
+                "name": item.get("name", ""),
+                "reason": err_msg,
+            })
+        state["pos"] = i + 1
+        # --- Délai humain entre envois ---
+        if i < total - 1 and not stop_event.is_set():
+            end = time.time() + random.uniform(min_delay, max_delay)
+            while time.time() < end:
+                if stop_event.is_set():
+                    break
+                time.sleep(1)
+    state["stopped"] = stop_event.is_set() and state["pos"] < total
+    state["done"] = True
+
+
+def _bulk_parse_emails_from_excel(file) -> pd.DataFrame:
+    """Extrait toutes les adresses email d'un fichier Excel (xlsx/xls/csv).
+    Détecte automatiquement la colonne contenant les emails.
+    Retourne un DataFrame avec colonnes : email, name (optionnel), [autres colonnes]."""
+    name = getattr(file, "name", "") or ""
+    try:
+        if name.endswith(".csv"):
+            df = pd.read_csv(file)
+        else:
+            df = pd.read_excel(file, engine="openpyxl")
+    except Exception:
+        file.seek(0)
+        try:
+            df = pd.read_csv(file)
+        except Exception:
+            return pd.DataFrame(columns=["email", "name"])
+    if df.empty:
+        return pd.DataFrame(columns=["email", "name"])
+    # --- Détection automatique de la colonne email ---
+    email_col = None
+    email_re = re.compile(r"email|e-mail|mail|adresse.*mail|courriel|destinat", re.I)
+    for c in df.columns:
+        if email_re.search(str(c)):
+            email_col = c
+            break
+    if email_col is None:
+        # Fallback : chercher une colonne contenant des @
+        for c in df.columns:
+            sample = df[c].dropna().astype(str).head(20)
+            if sample.str.contains(r"@", regex=True).any():
+                email_col = c
+                break
+    if email_col is None:
+        return pd.DataFrame(columns=["email", "name"])
+    # --- Détection colonne nom (optionnelle) ---
+    name_col = None
+    name_re = re.compile(r"^nom$|^name$|^prénom|^prenom|^first.?name|^contact|^destinat", re.I)
+    for c in df.columns:
+        if c != email_col and name_re.search(str(c)):
+            name_col = c
+            break
+    # --- Normalisation ---
+    emails_raw = df[email_col].dropna().astype(str).tolist()
+    email_pattern = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+    rows = []
+    for val in emails_raw:
+        found = email_pattern.findall(val)
+        if found:
+            email = found[0].strip().lower()
+            name = ""
+            if name_col:
+                idx = df[df[email_col].astype(str) == val].index
+                if len(idx) > 0:
+                    name = str(df.loc[idx[0], name_col]).strip()
+            if not name:
+                # Tenter d'extraire un nom du local-part de l'email
+                local = email.split("@")[0]
+                name = local.replace(".", " ").replace("_", " ").replace("-", " ").title()
+            rows.append({"email": email, "name": name})
+    result = pd.DataFrame(rows)
+    if not result.empty:
+        result.drop_duplicates(subset=["email"], inplace=True)
+        result.reset_index(drop=True, inplace=True)
+    return result
+
+
+def render_bulk_email_tab() -> None:
+    """Onglet Envoi Masse : Excel -> email unique -> envoi à toutes les adresses."""
+    st.markdown("### 📬 Envoi Masse (Excel → Gmail)")
+    st.caption(
+        "Uploadez un fichier Excel contenant des adresses email, rédigez un seul message, "
+        "et l'outil envoie l'email à chaque adresse une par une. Les erreurs sont ignorées "
+        "et l'envoi continue. **Limite Gmail : 500 emails / 24h par compte.**")
+
+    # ── 1) Upload du fichier Excel ──
+    with st.expander("📁 1. Importer le fichier Excel", expanded=True):
+        uploaded = st.file_uploader(
+            "Fichier Excel ou CSV avec les adresses email",
+            type=["xlsx", "xls", "csv"],
+            key="bulk_excel_upload",
+            help="Le logiciel détecte automatiquement la colonne email. "
+                 "Optionnel : colonne « Nom » pour personnaliser le message.")
+        if uploaded:
+            df_emails = _bulk_parse_emails_from_excel(uploaded)
+            if df_emails.empty:
+                st.error("Aucune adresse email trouvée dans le fichier. "
+                         "Vérifiez que le fichier contient une colonne avec des emails.")
+            else:
+                st.session_state["bulk_recipients"] = df_emails
+                st.success(f"✅ {len(df_emails)} adresse(s) email détectée(s) dans « {uploaded.name} »")
+                with st.expander("👁️ Aperçu des adresses", expanded=False):
+                    st.dataframe(df_emails, use_container_width=True, height=min(300, 40 + 35 * len(df_emails)))
+        elif "bulk_recipients" in st.session_state:
+            df_emails = st.session_state["bulk_recipients"]
+            if not df_emails.empty:
+                st.info(f"📁 {len(df_emails)} adresse(s) chargée(s) depuis le dernier import.")
+
+    # ── 2) Vérification des comptes Gmail ──
+    accounts = parse_gmail_accounts()
+    with st.expander("🔑 2. Compte(s) Gmail", expanded=True):
+        if not accounts:
+            st.error("❌ Aucun compte Gmail configuré. Renseignez au moins un compte dans la barre latérale "
+                     "(adresse Gmail + mot de passe d'application).")
+        else:
+            remaining = daily_remaining()
+            limit = daily_send_limit()
+            limit_str = f"{limit}" if limit > 0 else "illimité"
+            st.success(f"✅ {len(accounts)} compte(s) Gmail prêt(s) — "
+                       f"**{remaining}** envoi(s) restant(s) aujourd'hui (limite : {limit_str}/jour).")
+            with st.expander("📋 Détail des comptes", expanded=False):
+                for acc_email, _ in accounts:
+                    st.write(f"• {acc_email}")
+
+    # ── 3) Rédaction du message ──
+    with st.expander("✍️ 3. Rédiger le message", expanded=True):
+        bulk_subject = st.text_input(
+            "Objet de l'email", key="bulk_subject",
+            placeholder="Ex : Opportunité de collaboration",
+            help="L'objet est identique pour tous les destinataires.")
+        bulk_body = st.text_area(
+            "Corps du message", key="bulk_body", height=250,
+            placeholder="Bonjour,\n\nVotre message ici...",
+            help="Utilisez {Name} pour insérer le nom du destinataire (si détecté dans le fichier). "
+                 "Exemple : « Bonjour {Name}, … » → « Bonjour Jean Dupont, … »")
+        _bulk_spam = spam_risk_warning(bulk_subject, bulk_body)
+        if _bulk_spam:
+            st.warning(f"⚠️ Mots à risque de spam détectés : **{', '.join(_bulk_spam)}**. "
+                       "Remplacez-les pour éviter le dossier spam.")
+        st.caption("Placeholders disponibles : **{Name}** (nom du destinataire, si présent dans le fichier).")
+        if bulk_subject and bulk_body:
+            sample_name = "Jean Dupont"
+            preview = bulk_body.replace("{Name}", sample_name)
+            preview_subj = bulk_subject.replace("{Name}", sample_name)
+            with st.expander("👁️ Aperçu du message (exemple)", expanded=False):
+                st.markdown(f"**Objet :** {preview_subj}")
+                st.divider()
+                st.write(preview)
+
+    # --- Vérification état en cours (hors expander, pour tout le bloc) ---
+    running_bulk = bool(st.session_state.get("bulk_thread")
+                        and st.session_state["bulk_thread"].is_alive())
+
+    # ── 4) Lancement de l'envoi ──
+    with st.expander("🚀 4. Envoyer", expanded=True):
+        df_bulk = st.session_state.get("bulk_recipients")
+        if df_bulk is None or df_bulk.empty:
+            st.info("⚠️ Importez d'abord un fichier Excel contenant des adresses email.")
+        elif not accounts:
+            st.info("⚠️ Configurez au moins un compte Gmail dans la barre latérale.")
+        elif not bulk_subject or not bulk_body:
+            st.info("⚠️ Rédigez l'objet et le corps du message ci-dessus.")
+        else:
+            remaining = daily_remaining()
+            n = len(df_bulk)
+            will_send = min(n, remaining)
+            skipped = n - will_send
+            c1, c2 = st.columns([3, 1])
+            dmin, dmax = c1.slider(
+                "Délai entre envois (secondes)", 5, 300, (15, 15), step=5,
+                key="bulk_delay",
+                help="Délai humain entre chaque envoi (anti-spam). 15 s par défaut.")
+            test_bulk = c2.checkbox("Mode test (2–4 s)", key="bulk_test",
+                                    help="Délai réduit pour tester rapidement.")
+            if test_bulk:
+                dmin, dmax = 2, 4
+            st.markdown(
+                f"📊 **Résumé** : {n} destinataire(s) · "
+                f"**{will_send}** seront envoyés · "
+                + (f"**{skipped}** en attente (quota atteint)" if skipped else "quota suffisant")
+                + f" · Délai : {dmin}-{dmax} s")
+            b1, b2 = st.columns([3, 1])
+            if b1.button("▶️ Lancer l'envoi en masse", type="primary",
+                         use_container_width=True, disabled=running_bulk):
+                agency = st.session_state.get("agency", "")
+                queue = []
+                for _, row in df_bulk.iterrows():
+                    email_addr = str(row["email"]).strip()
+                    name_val = str(row.get("name", "")).strip()
+                    subj = bulk_subject.replace("{Name}", name_val or "")
+                    body_text = bulk_body.replace("{Name}", name_val or "")
+                    html = body_to_html(body_text)
+                    queue.append({
+                        "email": email_addr,
+                        "name": name_val or email_addr.split("@")[0].title(),
+                        "subject": subj,
+                        "body": body_text,
+                        "html": html,
+                    })
+                # Appliquer le quota restant
+                quota = daily_send_limit() or 999_999
+                queue_capped = queue[:remaining]
+                state = {
+                    "queue": queue_capped,
+                    "total_in_file": n,
+                    "log": [f"📬 Envoi en masse démarré — {len(queue_capped)} email(s) sur {n}"],
+                    "pos": 0,
+                    "done": False,
+                    "stopped": False,
+                    "quota": quota,
+                    "stats": {"sent": 0, "failed": 0, "errors": []},
+                }
+                st.session_state["bulk_state"] = state
+                st.session_state["bulk_stop"] = threading.Event()
+                send_fn = _account_send_fn(agency)
+                t = threading.Thread(
+                    target=bulk_mass_worker,
+                    args=(state, st.session_state["bulk_stop"], send_fn, int(dmin), int(dmax)),
+                    daemon=True)
+                st.session_state["bulk_thread"] = t
+                t.start()
+                state["campaign_id"] = _campaign_append("Envoi Masse (Excel)", len(queue_capped))["id"]
+                st.toast("📬 Envoi en masse démarré ✓")
+            if b2.button("⏹️ Stopper", use_container_width=True, disabled=not running_bulk):
+                st.session_state["bulk_stop"].set()
+                st.toast("Arrêt demandé…")
+
+    # ── 5) Suivi en direct + rapport final ──
+    state = st.session_state.get("bulk_state")
+    if state:
+        total = len(state["queue"])
+        total_in_file = state.get("total_in_file", total)
+        pos = state["pos"]
+        sent = state["stats"]["sent"]
+        failed = state["stats"]["failed"]
+        remaining_after = max(0, total - pos)
+        st.progress(pos / total if total else 0.0,
+                    text=f"Progression : {pos}/{total} — ✅ {sent} envoyé(s) · ❌ {failed} échec(s)")
+        if state["log"]:
+            with st.expander("📜 Journal d'envoi", expanded=not state["done"]):
+                st.code("\n".join(state["log"][-120:]), language=None)
+        if state["done"]:
+            # --- Rapport final ---
+            st.divider()
+            st.markdown("### 📊 Rapport final")
+            r1, r2, r3, r4 = st.columns(4)
+            r1.metric("✅ Envoyés", sent)
+            r2.metric("❌ Échoués", failed)
+            r3.metric("📊 Total traité", pos)
+            r4.metric("⏳ Restants", total_in_file - pos,
+                       help="Destinataires non traités (quota atteint ou arrêt manuel).")
+            if failed > 0:
+                with st.expander(f"❌ Détail des {failed} échec(s)", expanded=True):
+                    err_df = pd.DataFrame(state["stats"]["errors"])
+                    err_df.columns = ["Email", "Nom", "Raison de l'échec"]
+                    st.dataframe(err_df, use_container_width=True, height=min(400, 40 + 35 * len(err_df)))
+            if state.get("stopped"):
+                st.warning("⏹️ Envoi interrompu par l'utilisateur ou quota Gmail atteint. "
+                           f"{total_in_file - pos} email(s) restant(s).")
+            elif sent + failed > 0:
+                st.success(f"🎉 Campagne terminée — {sent} email(s) envoyé(s) avec succès.")
+            # Mettre à jour le compteur global
+            st.session_state["sent_count"] += sent
+            _campaign_update(state.get("campaign_id"), pos,
+                             "Interrompue" if state.get("stopped") else "Terminée")
+            if st.button("🔄 Réinitialiser pour une nouvelle campagne", key="bulk_reset"):
+                st.session_state.pop("bulk_state", None)
+                st.session_state.pop("bulk_recipients", None)
+                rerun()
+    elif running_bulk:
+        time.sleep(2)
+        rerun()
+
+    st.info(
+        "**Rappel** : Gmail limite l'envoi à **500 emails / 24h** par compte. "
+        "Pour envoyer plus, ajoutez des comptes additionnels dans la barre latérale "
+        "(« Comptes additionnels » — un email:motdepasse par ligne). "
+        "Les envois sont répartis automatiquement entre les comptes (round-robin).")
 
 
 # ------------------------------------------------------------------
 #  Tab 3 — Smart Outreach
 # ------------------------------------------------------------------
-
 
 def render_outreach_tab() -> None:
     st.markdown("### 🚀 Smart Outreach")
@@ -3887,14 +4211,16 @@ def main() -> None:
     st.markdown('<div class="side-sep"></div>', unsafe_allow_html=True)
 
     _tabs_kw = {"key": "main_tabs"} if "key" in inspect.signature(st.tabs).parameters else {}
-    tab1, tab2, tab3, tab4 = st.tabs(
-        ["🧭 Discovery", "🧠 Audit IA", "🚀 Outreach", "📊 Dashboard"], **_tabs_kw)
+    tab1, tab2, tab3, tab3b, tab4 = st.tabs(
+        ["🧭 Discovery", "🧠 Audit IA", "🚀 Outreach", "📬 Envoi Masse", "📊 Dashboard"], **_tabs_kw)
     with tab1:
         render_discovery_tab()
     with tab2:
         render_audit_tab()
     with tab3:
         render_outreach_tab()
+    with tab3b:
+        render_bulk_email_tab()
     with tab4:
         render_dashboard_tab()
 
