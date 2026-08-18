@@ -747,7 +747,7 @@ app.st.session_state["warmup_start"] = "2026-08-14"  # ISO str -> date
 app.init_session()
 assert app.st.session_state["warmup_enabled"] is False, app.st.session_state["warmup_enabled"]
 assert app.st.session_state["lang_en"] is True
-assert app.st.session_state["daily_limit"] == 200
+assert app.st.session_state["daily_limit"] == 500
 assert app.st.session_state["warmup_start"].__class__.__name__ == "date"
 # boot vierge (aucun fichier de settings) -> défauts sains, pas de crash
 _orig_sf = app.SETTINGS_FILE
@@ -757,7 +757,7 @@ app.st.session_state.pop("daily_limit", None)
 app.st.session_state.pop("warmup_start", None)
 app.init_session()
 assert app.st.session_state["warmup_enabled"] is False
-assert app.st.session_state["daily_limit"] == 200
+assert app.st.session_state["daily_limit"] == 500
 app.SETTINGS_FILE = _orig_sf
 out("[OK] coercition de types settings (bool/int/date) + défauts boot vierge")
 

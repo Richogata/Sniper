@@ -1809,8 +1809,8 @@ SMTP_HINT = ("💡 Identifiants Gmail refusés (535). Utilisez un MOT DE PASSE D
 
 # --- Multi-comptes Gmail : roulement automatique des expéditeurs + réchauffement ---
 
-# Réchauffement progressif : limite quotidienne par semaine (10 -> 30 -> 60 -> 100 -> …)
-WARMUP_SCHEDULE = [10, 30, 60, 100, 150, 200]
+# Réchauffement progressif : limite quotidienne par semaine (10 -> 50 -> 100 -> 200 -> 350 -> 500)
+WARMUP_SCHEDULE = [10, 50, 100, 200, 350, 500]
 
 
 def parse_gmail_accounts() -> list[tuple[str, str]]:
@@ -1862,9 +1862,9 @@ def daily_send_limit() -> int:
     weeks = max(0, (datetime.now().date() - d0).days // 7)
     if weeks >= len(WARMUP_SCHEDULE):
         try:
-            return max(0, int(st.session_state.get("daily_limit", 200) or 200))
+            return max(0, int(st.session_state.get("daily_limit", 500) or 500))
         except (TypeError, ValueError):
-            return 200
+            return 500
     return WARMUP_SCHEDULE[weeks]
 
 
@@ -2455,11 +2455,11 @@ def init_session() -> None:
     if _v is not None and not isinstance(_v, int):
         try:
             # vide/corrompu -> 200 (défaut sain du widget) ; "0" explicite -> 0 (illimité)
-            st.session_state["daily_limit"] = int(_v) if str(_v).strip() else 200
+            st.session_state["daily_limit"] = int(_v) if str(_v).strip() else 500
         except (TypeError, ValueError):
-            st.session_state["daily_limit"] = 200
+            st.session_state["daily_limit"] = 500
     st.session_state.setdefault("warmup_enabled", False)
-    st.session_state.setdefault("daily_limit", 200)
+    st.session_state.setdefault("daily_limit", 500)
     st.session_state.setdefault("warmup_start", datetime.now().date())
     if "_daily_sent" not in st.session_state:
         st.session_state["_daily_sent"] = {}
@@ -2666,13 +2666,12 @@ def render_sidebar() -> None:
                      key="africa_payment", height=70)
 
         st.markdown("### 🚦 Quota quotidien & réchauffement")
-        st.caption("Protège votre réputation d'expéditeur : Gmail limite à ~500 emails/jour "
-                   "par compte, et un volume soudain = spam. Le réchauffement augmente "
-                   "progressivement la limite (10 → 30 → 60 → … → 200/jour).")
+        st.caption("Gmail limite à **500 emails/jour** par compte. Le réchauffement "
+                   "augmente progressivement la limite (10 → 50 → 100 → 200 → 350 → 500/jour).")
         cw1, cw2 = st.columns(2)
         cw1.toggle("Plan de réchauffement", key="warmup_enabled",
                    help="Active la montée en volume progressive (2-4 semaines conseillées).")
-        cw2.number_input("Limite fixe / max (emails/jour)", 0, 5000, 200, key="daily_limit",
+        cw2.number_input("Limite fixe / max (emails/jour)", 0, 5000, 500, key="daily_limit",
                          help="0 = illimité (déconseillé). Limite maximale après réchauffement.")
         st.date_input("Date de début du réchauffement", key="warmup_start",
                       value=datetime.now().date(),
