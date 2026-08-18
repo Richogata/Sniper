@@ -576,6 +576,7 @@ EN_WA = {
 # ------------------------------------------------------------------
 
 SETTINGS_FILE = Path(__file__).resolve().parent / "settings.json"
+CAMPAIGNS_FILE = Path(__file__).resolve().parent / "campaigns.json"
 
 # Champs du dashboard sauvegardés instantanément dans settings.json.
 # ⚠️ Stockés EN CLAIR sur la machine locale (comme demandé) — protégez ce
@@ -2408,6 +2409,9 @@ def init_session() -> None:
     st.session_state.setdefault("bulk_state", None)
     st.session_state.setdefault("bulk_stop", threading.Event())
     st.session_state.setdefault("bulk_thread", None)
+    st.session_state.setdefault("bulk_schedule_date", datetime.now().date())
+    st.session_state.setdefault("bulk_schedule_time", datetime.now().strftime("%H:%M"))
+    st.session_state.setdefault("bulk_schedule_enabled", False)
     st.session_state.setdefault("wa_msg", "")
     st.session_state.setdefault("my_wa", "")
     st.session_state.setdefault("sectors_sel", [s["label"] for s in SECTORS[MODE_COPY]])
@@ -3324,9 +3328,217 @@ def _mark_wa(i: int) -> None:
 #  Tab 3b — Envoi Masse (Excel -> Gmail)
 # ------------------------------------------------------------------
 
+# ------------------------------------------------------------------
+#  Campagnes programmées — persistance + exécution automatique
+# ------------------------------------------------------------------
+
+# États possibles d'une campagne
+CAMP_PLANNED = "Programmée"
+CAMP_RUNNING = "En cours"
+CAMP_DONE = "Terminée"
+CAMP_CANCELLED = "Annulée"
+CAMP_PAUSED = "En attente (quota)"
+
+
+def _load_campaigns() -> list[dict]:
+    """Charge les campagnes depuis campaigns.json (retourne [] si absent/corrompu)."""
+    try:
+        with open(CAMPAIGNS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _save_campaigns(campaigns: list[dict]) -> None:
+    """Sauvegarde les campagnes dans campaigns.json."""
+    try:
+        with open(CAMPAIGNS_FILE, "w", encoding="utf-8") as f:
+            json.dump(campaigns, f, ensure_ascii=False, indent=2, default=str)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _campaign_create(subject: str, body: str, html: str,
+                     recipients: list[dict],
+                     images: list[dict] | None = None,
+                     attachments: list[dict] | None = None,
+                     scheduled_at: str = "",
+                     min_delay: int = 15, max_delay: int = 15) -> dict:
+    """Crée une nouvelle campagne et la sauvegarde."""
+    campaigns = _load_campaigns()
+    camp = {
+        "id": int(time.time() * 1000) % 10 ** 9,
+        "subject": subject,
+        "body": body,
+        "html": html,
+        "recipients": recipients,
+        "total": len(recipients),
+        "images": images or [],
+        "attachments": attachments or [],
+        "scheduled_at": scheduled_at,  # ISO format ou "" pour immédiat
+        "min_delay": min_delay,
+        "max_delay": max_delay,
+        "state": CAMP_PLANNED if scheduled_at else CAMP_RUNNING,
+        "sent": 0,
+        "failed": 0,
+        "pending": len(recipients),
+        "pos": 0,
+        "log": [],
+        "errors": [],
+        "created_at": datetime.now().isoformat(),
+        "started_at": "",
+        "finished_at": "",
+    }
+    campaigns.append(camp)
+    _save_campaigns(campaigns)
+    return camp
+
+
+def _campaign_update_field(camp_id: int, **kwargs) -> None:
+    """Met à jour des champs d'une campagne dans le fichier."""
+    campaigns = _load_campaigns()
+    for c in campaigns:
+        if c.get("id") == camp_id:
+            c.update(kwargs)
+            break
+    _save_campaigns(campaigns)
+
+
+def _campaign_cancel(camp_id: int) -> bool:
+    """Annule une campagne programmée. Retourne True si successful."""
+    campaigns = _load_campaigns()
+    for c in campaigns:
+        if c.get("id") == camp_id and c.get("state") == CAMP_PLANNED:
+            c["state"] = CAMP_CANCELLED
+            c["finished_at"] = datetime.now().isoformat()
+            _save_campaigns(campaigns)
+            return True
+    return False
+
+
+def execute_scheduled_campaign(camp: dict) -> None:
+    """Exécute une campagne (appelé par le monitor thread).
+    Gère le quota Gmail : si la limite est atteinte, met en pause et
+diffère les destinataires restants."""
+    camp_id = camp["id"]
+    _campaign_update_field(camp_id, state=CAMP_RUNNING,
+                           started_at=datetime.now().isoformat())
+
+    accounts = parse_gmail_accounts()
+    if not accounts:
+        _campaign_update_field(camp_id, state=CAMP_DONE,
+                               finished_at=datetime.now().isoformat())
+        return
+
+    agency = st.session_state.get("agency", "") if hasattr(st, "session_state") else ""
+    send_fn = _account_send_fn(agency)
+    stop_event = threading.Event()
+
+    queue = camp["recipients"][camp.get("pos", 0):]  # reprendre d'où on en était
+    total = camp["total"]
+    log = list(camp.get("log", []))
+    sent = camp.get("sent", 0)
+    failed = camp.get("failed", 0)
+    errors = list(camp.get("errors", []))
+    quota = daily_send_limit() or 500
+
+    log.append(f"\n🚀 Campagne #{camp_id} démarrée — {len(queue)} email(s) restant(s)")
+
+    for i, item in enumerate(queue):
+        if stop_event.is_set():
+            break
+        # Vérification quota
+        with _DAILY_LOCK:
+            if daily_sent_count() >= quota:
+                remaining_count = len(queue) - i
+                log.append(f"\n🛑 Quota Gmail atteint ({quota}/24h). "
+                           f"{remaining_count} email(s) mis en attente pour demain.")
+                _campaign_update_field(
+                    camp_id, state=CAMP_PAUSED, sent=sent, failed=failed,
+                    pos=camp.get("pos", 0) + i, log=log, errors=errors,
+                    pending=remaining_count)
+                return
+
+        log.append(f"→ [{sent + failed + 1}/{total}] {item.get('name', '')} <{item['email']}>")
+        try:
+            send_fn(item)
+            log.append("   ✅ envoyé")
+            sent += 1
+        except Exception as exc:  # noqa: BLE001
+            err_msg = str(exc)[:200]
+            log.append(f"   ❌ échec : {err_msg}")
+            if _is_bad_credentials(exc) and not any("Identifiants Gmail refusés" in l
+                                                     for l in log):
+                log.append("   " + SMTP_HINT)
+            failed += 1
+            errors.append({"email": item.get("email", ""),
+                           "name": item.get("name", ""), "reason": err_msg})
+        # Sauvegarde périodique (tous les 5 envois)
+        if (sent + failed) % 5 == 0:
+            _campaign_update_field(
+                camp_id, sent=sent, failed=failed,
+                pos=camp.get("pos", 0) + i + 1, log=log, errors=errors,
+                pending=max(0, total - sent - failed))
+        # Délai humain
+        if i < len(queue) - 1 and not stop_event.is_set():
+            end = time.time() + random.uniform(camp.get("min_delay", 15),
+                                               camp.get("max_delay", 15))
+            while time.time() < end:
+                if stop_event.is_set():
+                    break
+                time.sleep(1)
+
+    final_state = CAMP_DONE if not stop_event.is_set() else CAMP_CANCELLED
+    _campaign_update_field(
+        camp_id, state=final_state, sent=sent, failed=failed,
+        pos=camp.get("pos", 0) + len(queue), log=log, errors=errors,
+        pending=0, finished_at=datetime.now().isoformat())
+
+
+def _campaign_monitor_thread() -> None:
+    """Thread daemon qui vérifie les campagnes programmées toutes les 30 secondes."""
+    while True:
+        time.sleep(30)
+        try:
+            campaigns = _load_campaigns()
+            now = datetime.now()
+            for camp in campaigns:
+                state = camp.get("state")
+                if state == CAMP_PLANNED:
+                    sched = camp.get("scheduled_at", "")
+                    if sched:
+                        try:
+                            sched_dt = datetime.fromisoformat(sched)
+                        except ValueError:
+                            continue
+                        if now >= sched_dt:
+                            execute_scheduled_campaign(camp)
+                elif state == CAMP_PAUSED:
+                    # Reprendre si un nouveau jour a commencé (quota réinitialisé)
+                    try:
+                        started = camp.get("started_at", "")
+                        if started:
+                            started_dt = datetime.fromisoformat(started)
+                            if now.date() > started_dt.date():
+                                execute_scheduled_campaign(camp)
+                    except ValueError:
+                        pass
+        except Exception:  # noqa: BLE001
+            pass
+
+
+# Lancement du monitor au chargement du module
+_monitor_started = False
+if not _monitor_started:
+    _monitor_thread = threading.Thread(target=_campaign_monitor_thread, daemon=True)
+    _monitor_thread.start()
+    _monitor_started = True
+
+
 def bulk_mass_worker(state: dict, stop_event: threading.Event, send_fn,
                      min_delay: int, max_delay: int) -> None:
-    """Worker d'envoi en masse depuis un fichier Excel.
+    """Worker d'envoi en masse (immédiat, pas programmé).
     Gère le quota Gmail 500/24 h : arrêt automatique quand la limite est atteinte.
     Chaque échec est ignoré et l'envoi continue."""
     total = len(state["queue"])
@@ -3440,24 +3652,79 @@ def _bulk_parse_emails_from_excel(file) -> pd.DataFrame:
 
 
 def render_bulk_email_tab() -> None:
-    """Onglet Envoi Masse : Excel -> email visuel -> envoi à toutes les adresses.
+    """Onglet Envoi Masse : Excel -> email visuel -> envoi programmé ou immédiat.
 
     Fonctionnalités :
       · Upload Excel/CSV → détection auto colonne email + nom
       · Éditeur email : objet + corps avec barre d'outils (Gras, Italique, Lien, Image)
-      · 🖼️ Images inline dans le corps (CID, affichées dans Gmail)
+      · 🖼️ Images inline dans le corps (CID)
       · 📎 Documents joints (PDF, Word, Excel, etc.)
-      · 🔗 Liens cliquables dans le message
-      · 👁️ Aperçu HTML en direct
-      · 📊 Suivi en direct + rapport final
+      · 📅 Programmation date/heure précise
+      · ⏸️ Pause auto si quota atteint, reprise automatique le lendemain
+      · ❌ Erreurs ignorées, envoi continue
+      · 📊 Dashboard campagnes : Programmée → En cours → Terminée
     """
     st.markdown("### 📬 Envoi Masse (Excel → Gmail)")
     st.caption(
-        "Uploadez un fichier Excel contenant des adresses email, rédigez un message "
-        "avec des images, des liens et des pièces jointes, et l'outil envoie l'email "
-        "à chaque adresse une par une. Les erreurs sont ignorées. **500 emails / 24h par compte Gmail.**")
+        "Créez et programmez des campagnes d'envoi email. Upload Excel, rédigez votre "
+        "message avec images/liens/documents, choisissez la date d'envoi. **500 emails / 24h par compte Gmail.**")
 
-    # ── 1) Upload du fichier Excel ──
+    # ═══════════════════════════════════════════════════════════════
+    #  SECTION 1 : Dashboard des campagnes
+    # ═══════════════════════════════════════════════════════════════
+    _camp_states_icons = {
+        CAMP_PLANNED: "📅", CAMP_RUNNING: "🔄", CAMP_DONE: "✅",
+        CAMP_CANCELLED: "🚫", CAMP_PAUSED: "⏸️",
+    }
+    campaigns = _load_campaigns()
+    active_camps = [c for c in campaigns if c.get("state") in
+                    (CAMP_PLANNED, CAMP_RUNNING, CAMP_PAUSED)]
+    if campaigns:
+        with st.expander(f"📋 Campagnes ({len(campaigns)} total, {len(active_camps)} actives)",
+                         expanded=bool(active_camps)):
+            for camp in reversed(campaigns):
+                st_id = camp.get("id", 0)
+                state = camp.get("state", "")
+                icon = _camp_states_icons.get(state, "❓")
+                sched = camp.get("scheduled_at", "")
+                sched_str = "Immédiat" if not sched else sched.replace("T", " ")[:16]
+                pct = 0
+                if camp.get("total", 0) > 0:
+                    pct = int(100 * (camp.get("sent", 0) + camp.get("failed", 0)) / camp["total"])
+                # Ligne de statut
+                col_a, col_b, col_c = st.columns([5, 3, 2])
+                col_a.markdown(
+                    f"**{icon} Campagne #{st_id}** — {state}\n"
+                    f"📅 {sched_str} · 📧 {camp.get('total', 0)} destinataires")
+                col_b.markdown(
+                    f"✅ {camp.get('sent', 0)} envoyés · ❌ {camp.get('failed', 0)} échoués · "
+                    f"⏳ {camp.get('pending', 0)} restants")
+                if state in (CAMP_PLANNED, CAMP_PAUSED):
+                    col_c.warning(f"{pct}%")
+                    if col_c.button("🛑 Annuler", key=f"cancel_camp_{st_id}"):
+                        _campaign_cancel(st_id)
+                        st.toast(f"Campagne #{st_id} annulée ✓")
+                        rerun()
+                elif state == CAMP_DONE:
+                    col_c.success(f"{pct}%")
+                else:
+                    col_c.info(f"{pct}%")
+                # Journal détaillé
+                if camp.get("log"):
+                    with st.expander(f"📜 Journal #{st_id}", expanded=False):
+                        st.code("\n".join(camp["log"][-80:]), language=None)
+                if camp.get("errors"):
+                    with st.expander(f"❌ Erreurs #{st_id} ({len(camp['errors'])})", expanded=False):
+                        err_df = pd.DataFrame(camp["errors"])
+                        st.dataframe(err_df, use_container_width=True, height=200)
+                st.divider()
+
+    # ═══════════════════════════════════════════════════════════════
+    #  SECTION 2 : Création d'une campagne
+    # ═══════════════════════════════════════════════════════════════
+    st.markdown("#### ➕ Nouvelle campagne")
+
+    # ── 2a) Upload Excel ──
     with st.expander("📁 1. Importer le fichier Excel", expanded=True):
         uploaded = st.file_uploader(
             "Fichier Excel ou CSV avec les adresses email",
@@ -3468,8 +3735,7 @@ def render_bulk_email_tab() -> None:
         if uploaded:
             df_emails = _bulk_parse_emails_from_excel(uploaded)
             if df_emails.empty:
-                st.error("Aucune adresse email trouvée dans le fichier. "
-                         "Vérifiez que le fichier contient une colonne avec des emails.")
+                st.error("Aucune adresse email trouvée dans le fichier.")
             else:
                 st.session_state["bulk_recipients"] = df_emails
                 st.success(f"✅ {len(df_emails)} adresse(s) email détectée(s) dans « {uploaded.name} »")
@@ -3481,126 +3747,85 @@ def render_bulk_email_tab() -> None:
             if not df_emails.empty:
                 st.info(f"📁 {len(df_emails)} adresse(s) chargée(s) depuis le dernier import.")
 
-    # ── 2) Vérification des comptes Gmail ──
+    # ── 2b) Vérification comptes Gmail ──
     accounts = parse_gmail_accounts()
     with st.expander("🔑 2. Compte(s) Gmail", expanded=True):
         if not accounts:
-            st.error("❌ Aucun compte Gmail configuré. Renseignez au moins un compte dans la barre latérale "
-                     "(adresse Gmail + mot de passe d'application).")
+            st.error("❌ Aucun compte Gmail configuré. Renseignez au moins un compte dans la barre latérale.")
         else:
             remaining = daily_remaining()
             limit = daily_send_limit()
             limit_str = f"{limit}" if limit > 0 else "illimité"
             st.success(f"✅ {len(accounts)} compte(s) Gmail prêt(s) — "
                        f"**{remaining}** envoi(s) restant(s) aujourd'hui (limite : {limit_str}/jour).")
-            with st.expander("📋 Détail des comptes", expanded=False):
-                for acc_email, _ in accounts:
-                    st.write(f"• {acc_email}")
 
-    # ── 3) Éditeur email ──
+    # ── 2c) Éditeur email ──
     with st.expander("✍️ 3. Éditeur email", expanded=True):
-        # --- Objet ---
         bulk_subject = st.text_input(
             "📝 Objet de l'email", key="bulk_subject",
             placeholder="Ex : Opportunité de collaboration",
-            help="L'objet est identique pour tous les destinataires. "
-                 "Utilisez {Name} pour insérer le nom du destinataire.")
-
-        # --- Barre d'outils ---
-        st.markdown("**📝 Corps du message** — Utilisez la barre d'outils ci-dessous :")
+            help="Utilisez {Name} pour insérer le nom du destinataire.")
+        # Barre d'outils
+        st.markdown("**📝 Corps du message** — Barre d'outils :")
         t1, t2, t3, t4, t5 = st.columns(5)
-        if t1.button("**Gras**", key="bulk_btn_bold", help="Insère des astérisques pour le gras"):
-            cur = st.session_state.get("bulk_body", "")
-            st.session_state["bulk_body"] = cur + "**texte en gras**"
-        if t2.button("_Italique_", key="bulk_btn_italic", help="Insère des underscores pour l'italique"):
-            cur = st.session_state.get("bulk_body", "")
-            st.session_state["bulk_body"] = cur + "_texte en italique_"
-        if t3.button("🔗 Lien", key="bulk_btn_link", help="Insère un lien cliquable"):
-            cur = st.session_state.get("bulk_body", "")
-            st.session_state["bulk_body"] = cur + "[ texte du lien](https://example.com)"
-        if t4.button("🖼️ Image", key="bulk_btn_image", help="Insère une image par URL"):
-            cur = st.session_state.get("bulk_body", "")
-            st.session_state["bulk_body"] = cur + "![légende](https://example.com/image.png)"
-        if t5.button("↩️ Saut de ligne", key="bulk_btn_br", help="Insère un saut de paragraphe"):
-            cur = st.session_state.get("bulk_body", "")
-            st.session_state["bulk_body"] = cur + "\n\n"
-
-        # --- Corps du message ---
+        if t1.button("**Gras**", key="bulk_btn_bold"):
+            st.session_state["bulk_body"] = st.session_state.get("bulk_body", "") + "**texte**"
+        if t2.button("_Italique_", key="bulk_btn_italic"):
+            st.session_state["bulk_body"] = st.session_state.get("bulk_body", "") + "_texte_"
+        if t3.button("🔗 Lien", key="bulk_btn_link"):
+            st.session_state["bulk_body"] = st.session_state.get("bulk_body", "") + "[texte](https://…)"
+        if t4.button("🖼️ Image", key="bulk_btn_image"):
+            st.session_state["bulk_body"] = st.session_state.get("bulk_body", "") + "![alt](https://…/img.png)"
+        if t5.button("↩️ Saut", key="bulk_btn_br"):
+            st.session_state["bulk_body"] = st.session_state.get("bulk_body", "") + "\n\n"
         bulk_body = st.text_area(
             "Corps du message", key="bulk_body", height=300,
-            placeholder="Bonjour {Name},\n\n"
-                         "Votre message ici…\n\n"
-                         "Vous pouvez aussi insérer des liens : [texte](https://…), "
-                         "des images : ![alt](https://…/image.png).",
-            help="Placeholders : {Name} = nom du destinataire. "
-                 "Markdown supporté : **gras**, _italique_, [lien](url), ![image](url).")
-
-        # --- Images inline (CID dans le corps) ---
+            placeholder="Bonjour {Name},\n\nVotre message ici…",
+            help="Placeholders : {Name} · Markdown : **gras**, _italique_, [lien](url), ![image](url)")
+        # Images inline
         with st.expander("🖼️ Images dans le corps (inline CID)", expanded=False):
-            st.caption("Ces images sont intégrées directement dans l'email (pas en pièce jointe). "
-                       "Gmail et la plupart des clients les affichent en haut du message.")
             bulk_inline_imgs = st.file_uploader(
-                "Images à insérer dans le corps",
-                type=["png", "jpg", "jpeg", "gif", "webp"],
-                accept_multiple_files=True, key="bulk_inline_imgs",
-                help="Les images sont envoyées en inline (CID) — affichées dans le corps de l'email.")
+                "Images inline", type=["png", "jpg", "jpeg", "gif", "webp"],
+                accept_multiple_files=True, key="bulk_inline_imgs")
             inline_img_data = []
             for f in bulk_inline_imgs or []:
                 mime = (f.type or "image/png").split("/")
-                inline_img_data.append({
-                    "maintype": mime[0] or "image",
-                    "subtype": mime[1] if len(mime) > 1 else "png",
-                    "data": f.getvalue(),
-                })
+                inline_img_data.append({"maintype": mime[0] or "image",
+                                        "subtype": mime[1] if len(mime) > 1 else "png",
+                                        "data": f.getvalue()})
             st.session_state["bulk_inline_img_data"] = inline_img_data
             if inline_img_data:
                 st.success(f"{len(inline_img_data)} image(s) inline prête(s) ✓")
-
-        # --- Pièces jointes (documents) ---
+        # Documents joints
         with st.expander("📎 Pièces jointes (PDF, Word, Excel, etc.)", expanded=False):
-            st.caption("Joignez des documents à l'email : PDF, Word, Excel, images, etc. "
-                       "Les fichiers sont envoyés en pièce jointe (pas dans le corps).")
             bulk_attachments = st.file_uploader(
-                "Documents à joindre",
-                type=["pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
-                      "csv", "txt", "zip", "rar", "png", "jpg", "jpeg", "gif"],
-                accept_multiple_files=True, key="bulk_attachments",
-                help="Maximum 25 Mo au total (limite Gmail). Les fichiers sont joints en pièce jointe.")
+                "Documents", type=["pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
+                                    "csv", "txt", "zip", "rar", "png", "jpg", "jpeg", "gif"],
+                accept_multiple_files=True, key="bulk_attachments")
             attach_data = []
             total_size = 0
             for f in bulk_attachments or []:
                 data = f.getvalue()
                 total_size += len(data)
-                mime_type = f.type or "application/octet-stream"
-                parts = mime_type.split("/")
-                attach_data.append({
-                    "filename": f.name,
-                    "data": data,
-                    "maintype": parts[0] if parts else "application",
-                    "subtype": parts[1] if len(parts) > 1 else "octet-stream",
-                })
+                mt = (f.type or "application/octet-stream").split("/")
+                attach_data.append({"filename": f.name, "data": data,
+                                    "maintype": mt[0] if mt else "application",
+                                    "subtype": mt[1] if len(mt) > 1 else "octet-stream"})
             st.session_state["bulk_attach_data"] = attach_data
             if attach_data:
                 size_mb = total_size / (1024 * 1024)
-                size_color = "🟢" if size_mb < 20 else "🟡" if size_mb < 25 else "🔴"
-                st.success(f"{len(attach_data)} fichier(s) joint(s) — {size_color} {size_mb:.1f} Mo")
+                st.success(f"{len(attach_data)} fichier(s) — {size_mb:.1f} Mo")
                 for doc in attach_data:
-                    st.caption(f"  📄 {doc['filename']} ({doc['subtype']}, "
-                               f"{len(doc['data']) / 1024:.0f} Ko)")
+                    st.caption(f"  📄 {doc['filename']}")
                 if total_size > 25 * 1024 * 1024:
-                    st.error("⚠️ Total > 25 Mo — Gmail refuse les emails de plus de 25 Mo. "
-                             "Réduisez la taille ou le nombre de fichiers.")
-
-        # --- Avertissement spam ---
+                    st.error("⚠️ Total > 25 Mo — Gmail refuse les emails > 25 Mo.")
+        # Spam check
         _bulk_spam = spam_risk_warning(bulk_subject, bulk_body)
         if _bulk_spam:
-            st.warning(f"⚠️ Mots à risque de spam détectés : **{', '.join(_bulk_spam)}**. "
-                       "Remplacez-les pour éviter le dossier spam.")
+            st.warning(f"⚠️ Mots à risque spam : **{', '.join(_bulk_spam)}**")
+        st.caption("Placeholders : **{Name}** · Markdown : **gras**, _italique_, [lien](url), ![image](url)")
 
-        st.caption("Placeholders : **{Name}** = nom du destinataire · "
-                   "Markdown : **gras**, _italique_, [lien](url), ![image](url)")
-
-    # --- Aperçu HTML en direct ---
+    # ── 2d) Aperçu HTML ──
     if bulk_subject or bulk_body:
         with st.expander("👁️ Aperçu de l'email (rendu HTML)", expanded=False):
             sample_name = "Jean Dupont"
@@ -3612,56 +3837,70 @@ def render_bulk_email_tab() -> None:
             st.divider()
             st.components.v1.html(preview_html, height=400, scrolling=True)
             if st.session_state.get("bulk_attach_data"):
-                st.caption("📎 " + " · ".join(
-                    d["filename"] for d in st.session_state["bulk_attach_data"]))
+                st.caption("📎 " + " · ".join(d["filename"] for d in st.session_state["bulk_attach_data"]))
 
-    # --- Vérification état en cours ---
-    running_bulk = bool(st.session_state.get("bulk_thread")
-                        and st.session_state["bulk_thread"].is_alive())
-
-    # ── 4) Lancement de l'envoi ──
-    with st.expander("🚀 4. Envoyer", expanded=True):
+    # ═══════════════════════════════════════════════════════════════
+    #  SECTION 3 : Programmation et lancement
+    # ═══════════════════════════════════════════════════════════════
+    with st.expander("📅 4. Programmation & Lancement", expanded=True):
         df_bulk = st.session_state.get("bulk_recipients")
         if df_bulk is None or df_bulk.empty:
-            st.info("⚠️ Importez d'abord un fichier Excel contenant des adresses email.")
+            st.info("⚠️ Importez d'abord un fichier Excel.")
         elif not accounts:
-            st.info("⚠️ Configurez au moins un compte Gmail dans la barre latérale.")
+            st.info("⚠️ Configurez au moins un compte Gmail.")
         elif not bulk_subject or not bulk_body:
-            st.info("⚠️ Rédigez l'objet et le corps du message ci-dessus.")
+            st.info("⚠️ Rédigez l'objet et le corps du message.")
         else:
-            remaining = daily_remaining()
             n = len(df_bulk)
-            will_send = min(n, remaining)
-            skipped = n - will_send
-            # Résumé de la configuration
             n_imgs = len(st.session_state.get("bulk_inline_img_data") or [])
             n_docs = len(st.session_state.get("bulk_attach_data") or [])
-            parts = [
-                f"📊 **{n}** destinataire(s)",
-                f"**{will_send}** seront envoyés",
-            ]
-            if skipped:
-                parts.append(f"**{skipped}** en attente (quota)")
+            summary_parts = [f"📊 **{n}** destinataire(s)"]
             if n_imgs:
-                parts.append(f"🖼️ {n_imgs} image(s) inline")
+                summary_parts.append(f"🖼️ {n_imgs} image(s) inline")
             if n_docs:
-                parts.append(f"📎 {n_docs} document(s) joint(s)")
-            st.markdown(" · ".join(parts))
+                summary_parts.append(f"📎 {n_docs} document(s) joint(s)")
+            st.markdown(" · ".join(summary_parts))
 
+            # Options de programmation
+            sch1, sch2 = st.columns(2)
+            schedule_enabled = sch1.checkbox(
+                "📅 Programmer l'envoi", key="bulk_schedule_enabled",
+                help="Cochez pour choisir une date et heure précises d'envoi")
+            if schedule_enabled:
+                sch_date = sch2.date_input(
+                    "Date d'envoi", key="bulk_schedule_date",
+                    value=datetime.now().date(),
+                    min_value=datetime.now().date(),
+                    help="La campagne démarrera automatiquement à cette date")
+                sch_time = sch1.time_input(
+                    "Heure d'envoi", key="bulk_schedule_time",
+                    value=datetime.now().time().replace(second=0, microsecond=0),
+                    help="Heure précise de démarrage")
+                sched_dt = datetime.combine(sch_date, sch_time)
+                if sched_dt <= datetime.now():
+                    st.warning("⚠️ La date/heure sélectionnée est dans le passé. "
+                               "Choisissez une date future.")
+                    schedule_enabled = False
+                else:
+                    st.info(f"📅 Campagne programmée pour le **{sch_date.strftime('%d/%m/%Y')}** à **{sch_time.strftime('%H:%M')}**")
+            else:
+                sch_date = None
+                sch_time = None
+
+            # Délai humain
             c1, c2 = st.columns([3, 1])
             dmin, dmax = c1.slider(
                 "Délai entre envois (secondes)", 5, 300, (15, 15), step=5,
                 key="bulk_delay",
                 help="Délai humain entre chaque envoi (anti-spam). 15 s par défaut.")
-            test_bulk = c2.checkbox("Mode test (2–4 s)", key="bulk_test",
-                                    help="Délai réduit pour tester rapidement.")
+            test_bulk = c2.checkbox("Mode test (2–4 s)", key="bulk_test")
             if test_bulk:
                 dmin, dmax = 2, 4
 
-            b1, b2 = st.columns([3, 1])
-            if b1.button("▶️ Lancer l'envoi en masse", type="primary",
-                         use_container_width=True, disabled=running_bulk):
-                agency = st.session_state.get("agency", "")
+            # Bouton de lancement
+            btn_label = "📅 Programmer la campagne" if schedule_enabled else "▶️ Lancer l'envoi maintenant"
+            btn_type = "primary" if not schedule_enabled else "secondary"
+            if st.button(btn_label, type=btn_type, use_container_width=True):
                 img_list = st.session_state.get("bulk_inline_img_data") or []
                 cids = [f"img_{i}" for i in range(len(img_list))]
                 doc_list = st.session_state.get("bulk_attach_data") or []
@@ -3675,91 +3914,53 @@ def render_bulk_email_tab() -> None:
                     queue.append({
                         "email": email_addr,
                         "name": name_val or email_addr.split("@")[0].title(),
-                        "subject": subj,
-                        "body": body_text,
-                        "html": html,
+                        "subject": subj, "body": body_text, "html": html,
                         "images": img_list if img_list else None,
-                        "attachments": doc_list if doc_list else None,
-                    })
-                # Appliquer le quota restant
-                quota = daily_send_limit() or 999_999
-                queue_capped = queue[:remaining]
-                state = {
-                    "queue": queue_capped,
-                    "total_in_file": n,
-                    "log": [f"📬 Envoi en masse démarré — {len(queue_capped)} email(s) sur {n}"],
-                    "pos": 0,
-                    "done": False,
-                    "stopped": False,
-                    "quota": quota,
-                    "stats": {"sent": 0, "failed": 0, "errors": []},
-                }
-                st.session_state["bulk_state"] = state
-                st.session_state["bulk_stop"] = threading.Event()
-                send_fn = _account_send_fn(agency)
-                t = threading.Thread(
-                    target=bulk_mass_worker,
-                    args=(state, st.session_state["bulk_stop"], send_fn, int(dmin), int(dmax)),
-                    daemon=True)
-                st.session_state["bulk_thread"] = t
-                t.start()
-                state["campaign_id"] = _campaign_append("Envoi Masse (Excel)", len(queue_capped))["id"]
-                st.toast("📬 Envoi en masse démarré ✓")
-            if b2.button("⏹️ Stopper", use_container_width=True, disabled=not running_bulk):
-                st.session_state["bulk_stop"].set()
-                st.toast("Arrêt demandé…")
+                        "attachments": doc_list if doc_list else None})
+                sched_iso = ""
+                if schedule_enabled and sch_date and sch_time:
+                    sched_iso = datetime.combine(sch_date, sch_time).isoformat()
+                camp = _campaign_create(
+                    subject=bulk_subject, body=bulk_body, html=body_to_html(bulk_body),
+                    recipients=queue, images=img_list, attachments=doc_list,
+                    scheduled_at=sched_iso,
+                    min_delay=int(dmin), max_delay=int(dmax))
+                if schedule_enabled:
+                    st.toast(f"📅 Campagne #{camp['id']} programmée ✓", icon="📅")
+                else:
+                    st.toast(f"▶️ Campagne #{camp['id']} lancée ✓", icon="🚀")
+                    rerun()  # rafraîchir pour afficher le statut
 
-    # ── 5) Suivi en direct + rapport final ──
-    state = st.session_state.get("bulk_state")
-    if state:
-        total = len(state["queue"])
-        total_in_file = state.get("total_in_file", total)
-        pos = state["pos"]
-        sent = state["stats"]["sent"]
-        failed = state["stats"]["failed"]
-        remaining_after = max(0, total - pos)
-        st.progress(pos / total if total else 0.0,
-                    text=f"Progression : {pos}/{total} — ✅ {sent} envoyé(s) · ❌ {failed} échec(s)")
-        if state["log"]:
-            with st.expander("📜 Journal d'envoi", expanded=not state["done"]):
-                st.code("\n".join(state["log"][-120:]), language=None)
-        if state["done"]:
-            # --- Rapport final ---
-            st.divider()
-            st.markdown("### 📊 Rapport final")
-            r1, r2, r3, r4 = st.columns(4)
-            r1.metric("✅ Envoyés", sent)
-            r2.metric("❌ Échoués", failed)
-            r3.metric("📊 Total traité", pos)
-            r4.metric("⏳ Restants", total_in_file - pos,
-                       help="Destinataires non traités (quota atteint ou arrêt manuel).")
-            if failed > 0:
-                with st.expander(f"❌ Détail des {failed} échec(s)", expanded=True):
-                    err_df = pd.DataFrame(state["stats"]["errors"])
-                    err_df.columns = ["Email", "Nom", "Raison de l'échec"]
-                    st.dataframe(err_df, use_container_width=True,
-                                 height=min(400, 40 + 35 * len(err_df)))
-            if state.get("stopped"):
-                st.warning("⏹️ Envoi interrompu par l'utilisateur ou quota Gmail atteint. "
-                           f"{total_in_file - pos} email(s) restant(s).")
-            elif sent + failed > 0:
-                st.success(f"🎉 Campagne terminée — {sent} email(s) envoyé(s) avec succès.")
-            # Mettre à jour le compteur global
-            st.session_state["sent_count"] += sent
-            _campaign_update(state.get("campaign_id"), pos,
-                             "Interrompue" if state.get("stopped") else "Terminée")
-            if st.button("🔄 Réinitialiser pour une nouvelle campagne", key="bulk_reset"):
-                st.session_state.pop("bulk_state", None)
-                st.session_state.pop("bulk_recipients", None)
-                rerun()
-    elif running_bulk:
-        time.sleep(2)
-        rerun()
+    # ═══════════════════════════════════════════════════════════════
+    #  SECTION 4 : Suivi en direct des campagnes actives
+    # ═══════════════════════════════════════════════════════════════
+    campaigns = _load_campaigns()
+    running_camps = [c for c in campaigns if c.get("state") in (CAMP_RUNNING, CAMP_PAUSED)]
+    if running_camps:
+        for camp in running_camps:
+            st_id = camp.get("id", 0)
+            total = camp.get("total", 0)
+            pos = camp.get("pos", 0)
+            sent = camp.get("sent", 0)
+            failed = camp.get("failed", 0)
+            state = camp.get("state", "")
+            state_icon = _camp_states_icons.get(state, "❓")
+            st.markdown(f"#### {state_icon} Campagne #{st_id} — {state}")
+            if total > 0:
+                st.progress(pos / total, text=f"Progression : {pos}/{total} — ✅ {sent} · ❌ {failed}")
+            if camp.get("log"):
+                with st.expander(f"📜 Journal en direct #{st_id}", expanded=False):
+                    st.code("\n".join(camp["log"][-60:]), language=None)
+            if state == CAMP_PAUSED:
+                st.info("⏸️ En attente — le quota Gmail sera réinitialisé demain. "
+                        "La campagne reprendra automatiquement.")
+        time.sleep(10)
+        rerun()  # auto-refresh pour le suivi en direct
 
     st.info(
         "**Rappel** : Gmail limite l'envoi à **500 emails / 24h** par compte (25 Mo par email). "
-        "Pour envoyer plus, ajoutez des comptes additionnels dans la barre latérale « Comptes additionnels ». "
-        "Les envois sont répartis automatiquement entre les comptes (round-robin).")
+        "Si la limite est atteinte, les destinataires restants sont mis en attente et la campagne "
+        "reprend automatiquement le lendemain. Annulez une campagne programmée avant son lancement.")
 
 
 # ------------------------------------------------------------------
